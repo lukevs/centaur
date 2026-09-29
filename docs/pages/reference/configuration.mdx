@@ -35,9 +35,11 @@ iron-proxy instead of treating them as global platform configuration.
 These must exist for the normal Helm deployment. For local development,
 `just bootstrap-secrets` creates `centaur-infra-env` from your shell.
 
-| Env var | Set from | Controls |
+| Env var or Helm value | Set from | Controls |
 | --- | --- | --- |
 | `DATABASE_URL` | `secretManager.existingSecretName`; local bootstrap generates it. | API and Slackbot Postgres connection. |
+| `postgres.enabled` | Helm value, default `true`. | Runs the bundled ParadeDB StatefulSet. Set `false` for Aurora, RDS, or another externally managed database. |
+| `postgres.profile` / `CENTAUR_DATABASE_PROFILE` | Helm value, default `paradedb`; rendered into api-rs, Console, and sandboxes. | Selects the independently versioned `paradedb` or `postgresql` schema and search implementation. |
 | `SLACK_SIGNING_SECRET` | `secretManager.existingSecretName`; local bootstrap reads shell env. | Slack request signature verification. |
 | `SLACKBOT_API_KEY` | `secretManager.existingSecretName`; local bootstrap reads shell env. | Dedicated Slackbot key accepted by api-rs for the Slack session namespace and workflow events. |
 | `SLACK_BOT_TOKEN` | `secretManager.existingSecretName`; local bootstrap reads shell env. | Slack Web API access for Slackbot and api-rs Slack helpers. |

@@ -101,6 +101,8 @@ spec:
           image: {{ printf "%s:%s" $console.image.repository $console.image.tag | quote }}
           imagePullPolicy: {{ $console.image.pullPolicy }}
           env:
+            - name: CENTAUR_DATABASE_PROFILE
+              value: {{ .Values.postgres.profile | quote }}
             # Explicit secretKeyRefs only — never envFrom the shared Secret, or
             # its DATABASE_URL (ai_v2) would leak into console's env. Env
             # var names match the IRON_CONTROL_* secret keys 1:1 (except
@@ -366,6 +368,10 @@ spec:
             matchLabels:
 {{ include "centaur.componentSelectorLabels" (dict "root" . "component" "postgres") | nindent 14 }}
       ports:
+        - protocol: TCP
+          port: 5432
+{{- else }}
+    - ports:
         - protocol: TCP
           port: 5432
 {{- end }}

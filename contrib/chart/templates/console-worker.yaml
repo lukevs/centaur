@@ -78,6 +78,8 @@ spec:
           command:
             - bin/jobs
           env:
+            - name: CENTAUR_DATABASE_PROFILE
+              value: {{ .Values.postgres.profile | quote }}
             # Same secretKeyRefs as the web container so the worker can reach
             # Postgres and decrypt stored credentials. No PORT / static-file
             # serving — this process serves no HTTP.
@@ -213,6 +215,10 @@ spec:
             matchLabels:
 {{ include "centaur.componentSelectorLabels" (dict "root" . "component" "postgres") | nindent 14 }}
       ports:
+        - protocol: TCP
+          port: 5432
+{{- else }}
+    - ports:
         - protocol: TCP
           port: 5432
 {{- end }}

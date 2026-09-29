@@ -48,6 +48,24 @@ class Skill < ApplicationRecord
     return none if normalized.blank?
 
     quoted = connection.quote(normalized)
+    if DatabaseConfiguration.profile.equal?(DatabaseProfile::PARADEDB)
+      return paradedb_search(quoted)
+    end
+
+    document = "to_tsvector('english', coalesce(skills.name, '') || ' ' || coalesce(skills.description, '') || ' ' || coalesce(skills.content, ''))"
+    terms = "plainto_tsquery('english', #{quoted})"
+    rank = <<~SQL.squish
+      8 * ts_rank_cd(to_tsvector('english', coalesce(skills.name, '')), #{terms})
+      + 4 * ts_rank_cd(to_tsvector('english', coalesce(skills.description, '')), #{terms})
+      + ts_rank_cd(to_tsvector('english', coalesce(skills.content, '')), #{terms})
+    SQL
+    where("#{document} @@ #{terms}")
+      .order(Arel.sql("(lower(skills.name) = lower(#{quoted})) DESC"))
+      .order(Arel.sql("(#{rank}) DESC"))
+      .order(updated_at: :desc, id: :asc)
+  end
+
+  def self.paradedb_search(quoted)
     where(<<~SQL.squish)
       skills.name ||| #{quoted}::text::pdb.boost(8)
       OR skills.description ||| #{quoted}::text::pdb.boost(4)

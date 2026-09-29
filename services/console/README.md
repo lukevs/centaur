@@ -28,9 +28,10 @@ Operators manage credentials, principals, roles, and grants through the API or t
 
 ## Local Development
 
-Console requires ParadeDB with the `pg_search` extension. A vanilla Postgres
-server cannot run the Console schema or skill search. Install Docker, Ruby using
-the version in `.ruby-version`, and Overmind or Foreman, then run:
+Console defaults to ParadeDB and its BM25 search implementation. It can also run
+on stock PostgreSQL 16 with `CENTAUR_DATABASE_PROFILE=postgresql`, which selects
+PostgreSQL full-text search. Install Docker, Ruby using the version in
+`.ruby-version`, and Overmind or Foreman, then run:
 
 ```bash
 just dev
@@ -41,11 +42,12 @@ This starts a persistent `paradedb/paradedb:0.23.0-pg16` container named
 database, and starts the web and CSS processes. Database files are retained in
 the `centaur-console-paradedb-data` Docker volume between runs.
 
-To use an existing ParadeDB installation instead, set
+For stock PostgreSQL development, run `just postgres`, export
+`CENTAUR_DATABASE_PROFILE=postgresql`, and run `bin/rails db:prepare`. Rails
+builds this profile from migrations rather than loading the default ParadeDB
+schema dump. To use an existing database, set
 `CENTAUR_CONSOLE_DB_HOST`, `CENTAUR_CONSOLE_DB_PORT`,
-`CENTAUR_CONSOLE_DB_USERNAME`, and `CENTAUR_CONSOLE_DB_PASSWORD`, then set
-`CENTAUR_CONSOLE_MANAGE_PARADEDB=false` so `just dev` does not start Docker. The
-server must have `pg_search` installed and available to the Console database.
+`CENTAUR_CONSOLE_DB_USERNAME`, and `CENTAUR_CONSOLE_DB_PASSWORD`.
 
 ## Environment Variables
 

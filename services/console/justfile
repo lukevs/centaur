@@ -29,9 +29,14 @@ dev: deps paradedb
     @echo "   api key:  $CENTAUR_CONSOLE_INITIAL_API_KEY"
     bin/dev
 
-# Start the persistent ParadeDB container used by local Console development.
+# Start the default persistent ParadeDB container used by local development.
 paradedb:
     script/start-paradedb
+
+# Start an optional stock PostgreSQL container. Run Rails commands with
+# CENTAUR_DATABASE_PROFILE=postgresql when using it.
+postgres:
+    script/start-postgres
 
 # Build the Tailwind CSS bundle once (app/assets/builds/tailwind.css).
 css:

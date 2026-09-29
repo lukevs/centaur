@@ -7,13 +7,16 @@ default: &default
   port: <%= ConsoleEnv.fetch("DB_PORT", 5432) %>
   username: <%= ConsoleEnv.fetch("DB_USERNAME", "postgres") %>
   password: <%= ConsoleEnv.fetch("DB_PASSWORD", "") %>
+  # The checked-in schema dump represents the default ParadeDB profile. Stock
+  # PostgreSQL must bootstrap from migrations so it never loads ParadeDB-only
+  # extensions or indexes.
+  schema_dump: <%= DatabaseConfiguration.profile.equal?(DatabaseProfile::POSTGRESQL) ? false : "schema.rb" %>
 
 development:
   <<: *default
   database: iron_control_development
-  # The ParadeDB image bootstraps demo extensions (postgis, vector, pg_ivm)
-  # into template1. Databases cloned from it inherit those extensions, and a
-  # schema dump then writes them all into schema.rb. template0 is always empty.
+  # The ParadeDB image bootstraps demo extensions into template1. template0
+  # keeps schema dumps reproducible and is also valid for stock PostgreSQL.
   template: template0
 
 # Warning: The database defined as "test" will be erased and
@@ -22,7 +25,6 @@ development:
 test:
   <<: *default
   database: iron_control_test
-  # See the development note: template0 keeps schema.rb reproducible.
   template: template0
 
 production:

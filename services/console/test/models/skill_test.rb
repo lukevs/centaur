@@ -85,6 +85,15 @@ class SkillTest < ActiveSupport::TestCase
     assert_not_includes results, skills(:other_private)
   end
 
+  test "search works with the stock PostgreSQL profile" do
+    results = with_env("CENTAUR_DATABASE_PROFILE" => "postgresql") do
+      Skill.catalog_visible_to(users(:member_user)).search("production incidents").to_a
+    end
+
+    assert_includes results, skills(:member_private)
+    assert_not_includes results, skills(:other_private)
+  end
+
   test "editors can access private skills without becoming owners" do
     skill = skills(:other_private)
     editor = users(:member_user)

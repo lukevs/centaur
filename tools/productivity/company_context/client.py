@@ -11,6 +11,7 @@ import urllib.request
 from collections import Counter
 from contextlib import suppress
 from datetime import UTC, datetime
+from enum import StrEnum
 from typing import Any
 from urllib.parse import urlparse, urlunparse
 
@@ -31,6 +32,7 @@ OPENAI_API_KEY_ENV = "OPENAI_API_KEY"
 COMPANY_CONTEXT_EMBEDDINGS_ENABLED_ENV = "COMPANY_CONTEXT_EMBEDDINGS_ENABLED"
 COMPANY_CONTEXT_EMBEDDINGS_MODEL_ENV = "COMPANY_CONTEXT_EMBEDDINGS_MODEL"
 COMPANY_CONTEXT_EMBEDDINGS_DIMENSIONS_ENV = "COMPANY_CONTEXT_EMBEDDINGS_DIMENSIONS"
+DATABASE_PROFILE_ENV = "CENTAUR_DATABASE_PROFILE"
 DEFAULT_QUERY_LIMIT = 100
 MAX_QUERY_LIMIT = 1_000
 DEFAULT_QUERY_TIMEOUT_SECONDS = 10
@@ -59,6 +61,12 @@ METRICS_PUSH_TIMEOUT_SECONDS = 1.0
 LOOKUP_REQUEST_METRIC = "company_context_lookup_requests"
 LOOKUP_RESULT_METRIC = "company_context_lookup_results"
 LOOKUP_ZERO_RESULT_METRIC = "company_context_lookup_zero_results"
+
+
+class DatabaseProfile(StrEnum):
+    PARADEDB = "paradedb"
+    POSTGRESQL = "postgresql"
+
 
 _SEARCH_TERM_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:/-]*")
 _STOP_WORDS = {
@@ -339,18 +347,56 @@ def _search_terms(query: str) -> list[str]:
 
 
 def _search_where_clause(term_count: int) -> str:
-    """Build a ParadeDB query that boosts exact matches and falls back to OR term matching."""
-    clauses = [
-        "("
-        f"title ||| $1::text::pdb.boost({EXACT_QUERY_TITLE_BOOST}) "
-        f"OR body ||| $1::text::pdb.boost({EXACT_QUERY_BODY_BOOST})"
-        ")"
+    """Build the configured backend's keyword-search predicate."""
+    if _database_profile() is DatabaseProfile.PARADEDB:
+        clauses = [
+            "("
+            f"title ||| $1::text::pdb.boost({EXACT_QUERY_TITLE_BOOST}) "
+            f"OR body ||| $1::text::pdb.boost({EXACT_QUERY_BODY_BOOST})"
+            ")"
+        ]
+        for index in range(2, term_count + 2):
+            clauses.append(
+                f"(title ||| ${index}::text::pdb.boost({TITLE_MATCH_BOOST}) "
+                f"OR body ||| ${index}::text)"
+            )
+        return f"({' OR '.join(clauses)})"
+
+    document = "to_tsvector('english', coalesce(title, '') || ' ' || coalesce(body, ''))"
+    clauses = [f"{document} @@ phraseto_tsquery('english', $1::text)"]
+    for index in range(2, term_count + 2):
+        clauses.append(f"{document} @@ plainto_tsquery('english', ${index}::text)")
+    return f"({' OR '.join(clauses)})"
+
+
+def _search_score_clause(term_count: int) -> str:
+    if _database_profile() is DatabaseProfile.PARADEDB:
+        return "paradedb.score(document_id)"
+
+    title = "to_tsvector('english', coalesce(title, ''))"
+    body = "to_tsvector('english', coalesce(body, ''))"
+    phrase = "phraseto_tsquery('english', $1::text)"
+    scores = [
+        f"{EXACT_QUERY_TITLE_BOOST} * ts_rank_cd({title}, {phrase})",
+        f"{EXACT_QUERY_BODY_BOOST} * ts_rank_cd({body}, {phrase})",
     ]
     for index in range(2, term_count + 2):
-        clauses.append(
-            f"(title ||| ${index}::text::pdb.boost({TITLE_MATCH_BOOST}) OR body ||| ${index}::text)"
+        term = f"plainto_tsquery('english', ${index}::text)"
+        scores.extend(
+            (f"{TITLE_MATCH_BOOST} * ts_rank_cd({title}, {term})", f"ts_rank_cd({body}, {term})")
         )
-    return f"({' OR '.join(clauses)})"
+    return "(" + " + ".join(scores) + ")"
+
+
+def _database_profile() -> DatabaseProfile:
+    profile = os.getenv(DATABASE_PROFILE_ENV, DatabaseProfile.PARADEDB.value)
+    try:
+        return DatabaseProfile(profile)
+    except ValueError as error:
+        raise ValueError(
+            f"unsupported {DATABASE_PROFILE_ENV}={profile!r}; "
+            "expected paradedb or postgresql"
+        ) from error
 
 
 def _body_preview(body: str, *, query: str, max_chars: int = DEFAULT_PREVIEW_CHARS) -> str:
@@ -802,7 +848,7 @@ class CompanyContextClient:
                     occurred_at,
                     source_updated_at,
                     metadata,
-                    paradedb.score(document_id) AS score
+                    {_search_score_clause(len(terms))} AS score
                 FROM company_context_documents
                 WHERE {_search_where_clause(len(terms))}
                   AND (${source_param}::text IS NULL OR source = ${source_param})
@@ -812,7 +858,7 @@ class CompanyContextClient:
                   AND (${occurred_before_param}::timestamptz IS NULL
                        OR occurred_at < ${occurred_before_param})
                 ORDER BY
-                    paradedb.score(document_id)
+                    {_search_score_clause(len(terms))}
                     * CASE source_type
                         WHEN 'slack_thread' THEN {THREAD_SCORE_MULTIPLIER}
                         WHEN 'slack_channel_day' THEN {CHANNEL_DAY_SCORE_MULTIPLIER}
@@ -982,14 +1028,14 @@ class CompanyContextClient:
                 source_created_at,
                 source_modified_at,
                 metadata,
-                paradedb.score(document_id) AS score
+                {_search_score_clause(term_count)} AS score
             FROM google_docs_context_documents
             WHERE {_search_where_clause(term_count)}
               AND (${modified_after_param}::timestamptz IS NULL
                    OR source_modified_at >= ${modified_after_param})
               AND (${modified_before_param}::timestamptz IS NULL
                    OR source_modified_at < ${modified_before_param})
-            ORDER BY paradedb.score(document_id) DESC,
+            ORDER BY {_search_score_clause(term_count)} DESC,
                      source_modified_at DESC NULLS LAST,
                      document_id ASC
             LIMIT ${limit_param}
@@ -1029,14 +1075,14 @@ class CompanyContextClient:
                 occurred_at,
                 source_updated_at,
                 metadata,
-                paradedb.score(document_id) AS score
+                {_search_score_clause(term_count)} AS score
             FROM granola_context_documents
             WHERE {_search_where_clause(term_count)}
               AND (${occurred_after_param}::timestamptz IS NULL
                    OR occurred_at >= ${occurred_after_param})
               AND (${occurred_before_param}::timestamptz IS NULL
                    OR occurred_at < ${occurred_before_param})
-            ORDER BY paradedb.score(document_id) DESC,
+            ORDER BY {_search_score_clause(term_count)} DESC,
                      occurred_at DESC NULLS LAST,
                      source_updated_at DESC NULLS LAST,
                      document_id ASC
@@ -1552,10 +1598,10 @@ class CompanyContextClient:
                     participant_labels,
                     participant_count,
                     metadata,
-                    paradedb.score(document_id) AS score
+                    {_search_score_clause(len(terms))} AS score
                 FROM slack_private_conversation_context_documents
                 WHERE {_search_where_clause(len(terms))}
-                ORDER BY paradedb.score(document_id) DESC,
+                ORDER BY {_search_score_clause(len(terms))} DESC,
                          last_seen_at DESC NULLS LAST,
                          source_updated_at DESC NULLS LAST
                 LIMIT ${limit_param}
@@ -1647,7 +1693,7 @@ class CompanyContextClient:
                     occurred_at,
                     source_updated_at,
                     metadata,
-                    paradedb.score(document_id) AS score
+                    {_search_score_clause(len(terms))} AS score
                 FROM slack_private_context_documents
                 WHERE {_search_where_clause(len(terms))}
                   AND (${conversation_id_param}::text IS NULL
@@ -1656,7 +1702,7 @@ class CompanyContextClient:
                        OR occurred_at >= ${occurred_after_param})
                   AND (${occurred_before_param}::timestamptz IS NULL
                        OR occurred_at < ${occurred_before_param})
-                ORDER BY paradedb.score(document_id) DESC,
+                ORDER BY {_search_score_clause(len(terms))} DESC,
                          occurred_at DESC NULLS LAST,
                          source_updated_at DESC NULLS LAST
                 LIMIT ${limit_param}

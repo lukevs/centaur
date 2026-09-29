@@ -19,7 +19,41 @@ use time::{Duration as TimeDuration, OffsetDateTime};
 use uuid::Uuid;
 
 // The API binary embeds these migrations at compile time.
-static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations/paradedb");
+static PARADEDB_MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations/paradedb");
+static POSTGRESQL_MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations/postgresql");
+
+const DATABASE_PROFILE_ENV: &str = "CENTAUR_DATABASE_PROFILE";
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum DatabaseProfile {
+    #[default]
+    ParadeDb,
+    PostgreSql,
+}
+
+impl DatabaseProfile {
+    pub fn from_env() -> Result<Self, SessionStoreError> {
+        match std::env::var(DATABASE_PROFILE_ENV) {
+            Ok(value) => value.parse(),
+            Err(std::env::VarError::NotPresent) => Ok(Self::default()),
+            Err(error) => Err(SessionStoreError::InvalidDatabaseProfile(error.to_string())),
+        }
+    }
+}
+
+impl FromStr for DatabaseProfile {
+    type Err = SessionStoreError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "paradedb" | "parade" => Ok(Self::ParadeDb),
+            "postgresql" | "postgres" => Ok(Self::PostgreSql),
+            value => Err(SessionStoreError::InvalidDatabaseProfile(format!(
+                "unsupported value {value:?}; expected paradedb or postgresql"
+            ))),
+        }
+    }
+}
 
 pub const SESSION_EVENTS_CHANNEL: &str = "centaur_session_events";
 const DEFAULT_MAX_CONNECTIONS: u32 = 500;
@@ -106,7 +140,17 @@ impl PgSessionStore {
     }
 
     pub async fn run_migrations(&self) -> Result<(), SessionStoreError> {
-        MIGRATOR.run(&self.pool).await?;
+        self.run_migrations_for(DatabaseProfile::from_env()?).await
+    }
+
+    pub async fn run_migrations_for(
+        &self,
+        profile: DatabaseProfile,
+    ) -> Result<(), SessionStoreError> {
+        match profile {
+            DatabaseProfile::ParadeDb => PARADEDB_MIGRATOR.run(&self.pool).await?,
+            DatabaseProfile::PostgreSql => POSTGRESQL_MIGRATOR.run(&self.pool).await?,
+        }
         Ok(())
     }
 
@@ -1839,6 +1883,8 @@ pub struct SessionEventNotification {
 
 #[derive(Debug, Error)]
 pub enum SessionStoreError {
+    #[error("invalid database profile: {0}")]
+    InvalidDatabaseProfile(String),
     #[error("session not found for thread_key {thread_key}")]
     NotFound { thread_key: String },
     #[error(

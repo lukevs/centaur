@@ -17,6 +17,11 @@ from client import CompanyContextClient
 from centaur_sdk.tool_sdk import ToolContext, reset_tool_context, set_tool_context
 
 
+@pytest.fixture
+def use_postgresql_profile(monkeypatch):
+    monkeypatch.setenv("CENTAUR_DATABASE_PROFILE", "postgresql")
+
+
 class _FakeConnection:
     def __init__(
         self,
@@ -111,6 +116,55 @@ class _FakeOpenAIClient:
 def _disable_lookup_metric_push(monkeypatch):
     monkeypatch.setenv("COMPANY_CONTEXT_LOOKUP_METRICS_ENABLED", "0")
     monkeypatch.setenv("COMPANY_CONTEXT_EMBEDDINGS_ENABLED", "false")
+
+
+def test_search_defaults_to_paradedb_bm25(monkeypatch):
+    monkeypatch.delenv("CENTAUR_DATABASE_PROFILE", raising=False)
+    fake = _FakeConnection(rows=[])
+
+    async def fake_connect(*args, **kwargs):
+        return fake
+
+    monkeypatch.setattr(company_context_client.asyncpg, "connect", fake_connect)
+
+    result = CompanyContextClient("postgresql://example").search(
+        "indexing plan",
+        source="slack",
+        source_type="slack_thread",
+        hybrid=False,
+    )
+
+    assert result["status"] == "ok"
+    query, _args = fake.fetch_calls[0]
+    assert "title ||| $1::text::pdb.boost(8)" in query
+    assert "body ||| $3::text" in query
+    assert "paradedb.score(document_id)" in query
+    assert "ts_rank_cd(" not in query
+
+
+def test_search_rejects_invalid_database_profile(monkeypatch):
+    monkeypatch.setenv("CENTAUR_DATABASE_PROFILE", "mysql")
+    fake = _FakeConnection(rows=[])
+
+    async def fake_connect(*args, **kwargs):
+        return fake
+
+    monkeypatch.setattr(company_context_client.asyncpg, "connect", fake_connect)
+
+    result = CompanyContextClient("postgresql://example").search(
+        "indexing plan",
+        source="slack",
+        source_type="slack_thread",
+        hybrid=False,
+    )
+
+    assert result == {
+        "status": "error",
+        "error": "unsupported CENTAUR_DATABASE_PROFILE='mysql'; "
+        "expected paradedb or postgresql",
+    }
+    assert fake.fetch_calls == []
+    assert fake.closed is True
 
 
 @pytest.mark.parametrize("query", ["", "   "])
@@ -258,7 +312,9 @@ def test_query_clamps_limit_and_timeout(monkeypatch):
     ]
 
 
-def test_search_queries_bm25_and_returns_compact_results(monkeypatch):
+def test_search_queries_postgres_fts_and_returns_compact_results(
+    monkeypatch, use_postgresql_profile
+):
     occurred_at = dt.datetime(2026, 5, 8, 12, 0, tzinfo=dt.UTC)
     source_updated_at = dt.datetime(2026, 5, 8, 12, 5, tzinfo=dt.UTC)
     fake = _FakeConnection(
@@ -318,14 +374,14 @@ def test_search_queries_bm25_and_returns_compact_results(monkeypatch):
         "metadata": {"channel_name": "eng-ai", "thread_ts": "1770000000.000000"},
     }
     query, args = fake.fetch_calls[0]
-    assert "title ||| $1::text::pdb.boost(8) OR body ||| $1::text::pdb.boost(2)" in query
-    assert "title ||| $2::text::pdb.boost(4) OR body ||| $2::text" in query
-    assert "title ||| $3::text::pdb.boost(4) OR body ||| $3::text" in query
-    assert ") OR (" in query
+    assert "@@ phraseto_tsquery('english', $1::text)" in query
+    assert "@@ plainto_tsquery('english', $2::text)" in query
+    assert "@@ plainto_tsquery('english', $3::text)" in query
+    assert " OR to_tsvector(" in query
     assert "WHEN 'slack_thread' THEN 1.25" in query
     assert "WHEN 'slack_channel_day' THEN 0.75" in query
     assert "END DESC" in query
-    assert "paradedb.score(document_id)" in query
+    assert "ts_rank_cd(" in query
     assert "metadata ->> 'channel_id'" not in query
     assert args == (
         "ParadeDB BM25",
@@ -766,7 +822,7 @@ def test_lookup_metrics_use_metrics_runtime_labels(monkeypatch):
     )
 
 
-def test_search_uses_or_terms_and_drops_stop_words(monkeypatch):
+def test_search_uses_or_terms_and_drops_stop_words(monkeypatch, use_postgresql_profile):
     fake = _FakeConnection(rows=[])
 
     async def fake_connect(*args, **kwargs):
@@ -783,11 +839,11 @@ def test_search_uses_or_terms_and_drops_stop_words(monkeypatch):
     query, args = fake.fetch_calls[0]
     keyword_clause = company_context_client._search_where_clause(4)
     assert f"WHERE {keyword_clause}" in query
-    assert "OR (title ||| $2::text::pdb.boost(4) OR body ||| $2::text)" in query
-    assert "OR (title ||| $3::text::pdb.boost(4) OR body ||| $3::text)" in query
-    assert "OR (title ||| $4::text::pdb.boost(4) OR body ||| $4::text)" in query
-    assert "OR (title ||| $5::text::pdb.boost(4) OR body ||| $5::text)" in query
-    assert "title ||| $6::text::pdb.boost(4)" not in query
+    assert "@@ plainto_tsquery('english', $2::text)" in query
+    assert "@@ plainto_tsquery('english', $3::text)" in query
+    assert "@@ plainto_tsquery('english', $4::text)" in query
+    assert "@@ plainto_tsquery('english', $5::text)" in query
+    assert "@@ plainto_tsquery('english', $6::text)" not in query
     placeholders = {int(match.group(1)) for match in re.finditer(r"\$(\d+)", query)}
     assert placeholders == set(range(1, len(args) + 1))
     assert "metadata ->> 'channel_id'" not in query
@@ -805,7 +861,7 @@ def test_search_uses_or_terms_and_drops_stop_words(monkeypatch):
     )
 
 
-def test_search_applies_occurred_at_filters(monkeypatch):
+def test_search_applies_occurred_at_filters(monkeypatch, use_postgresql_profile):
     fake = _FakeConnection(rows=[])
 
     async def fake_connect(*args, **kwargs):
@@ -827,7 +883,7 @@ def test_search_applies_occurred_at_filters(monkeypatch):
     assert result["occurred_before"] == "2026-05-08T12:30:00+00:00"
     query, args = fake.fetch_calls[0]
     keyword_clause = company_context_client._search_where_clause(1)
-    assert keyword_clause.startswith("((")
+    assert keyword_clause.startswith("(to_tsvector(")
     assert keyword_clause.endswith("))")
     assert f"WHERE {keyword_clause}" in query
     assert "OR occurred_at >= $5" in query
@@ -1068,7 +1124,7 @@ def test_search_dm_conversations_rejects_empty_query(query):
     assert result == {"status": "error", "error": "query cannot be empty"}
 
 
-def test_search_dm_conversations_queries_projection(monkeypatch):
+def test_search_dm_conversations_queries_projection(monkeypatch, use_postgresql_profile):
     last_seen_at = dt.datetime(2026, 5, 8, 12, 0, tzinfo=dt.UTC)
     source_updated_at = dt.datetime(2026, 5, 8, 12, 5, tzinfo=dt.UTC)
     fake = _FakeConnection(
@@ -1131,15 +1187,17 @@ def test_search_dm_conversations_queries_projection(monkeypatch):
     }
     query, args = fake.fetch_calls[0]
     assert "FROM slack_private_conversation_context_documents" in query
-    assert "title ||| $1::text::pdb.boost(8) OR body ||| $1::text::pdb.boost(2)" in query
-    assert "OR (title ||| $2::text::pdb.boost(4) OR body ||| $2::text)" in query
+    assert "@@ phraseto_tsquery('english', $1::text)" in query
+    assert "@@ plainto_tsquery('english', $2::text)" in query
     assert "LIMIT $3" in query
     assert "centaur_search_slack_dm_conversations" not in query
     assert args == ("Tom", "Tom", 50)
     assert fake.closed is True
 
 
-def test_search_dms_queries_bm25_and_returns_compact_results(monkeypatch):
+def test_search_dms_queries_postgres_fts_and_returns_compact_results(
+    monkeypatch, use_postgresql_profile
+):
     occurred_at = dt.datetime(2026, 5, 8, 12, 0, tzinfo=dt.UTC)
     source_updated_at = dt.datetime(2026, 5, 8, 12, 5, tzinfo=dt.UTC)
     fake = _FakeConnection(
@@ -1214,9 +1272,9 @@ def test_search_dms_queries_bm25_and_returns_compact_results(monkeypatch):
     }
     query, args = fake.fetch_calls[0]
     assert "FROM slack_private_context_documents" in query
-    assert "title ||| $1::text::pdb.boost(8) OR body ||| $1::text::pdb.boost(2)" in query
-    assert "OR (title ||| $2::text::pdb.boost(4) OR body ||| $2::text)" in query
-    assert "OR (title ||| $3::text::pdb.boost(4) OR body ||| $3::text)" in query
+    assert "@@ phraseto_tsquery('english', $1::text)" in query
+    assert "@@ plainto_tsquery('english', $2::text)" in query
+    assert "@@ plainto_tsquery('english', $3::text)" in query
     assert "conversation_id = $4" in query
     assert "OR occurred_at >= $5" in query
     assert "OR occurred_at < $6" in query

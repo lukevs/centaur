@@ -7,7 +7,7 @@ use std::{
 
 use sqlx::{Connection, Executor, PgConnection, Row, postgres::PgConnectOptions};
 
-static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
+static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations/paradedb");
 static RLS_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 #[derive(Debug, PartialEq, Eq)]

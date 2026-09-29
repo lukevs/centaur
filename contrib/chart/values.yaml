@@ -582,6 +582,9 @@ apiRs:
       batchSize: 50
     companyContextEmbeddings:
       # Enables the embedding workflow and hybrid search in agent sandboxes.
+      # Requires the standard pgvector extension. Aurora PostgreSQL and RDS for
+      # PostgreSQL expose it as the `vector` extension. The bundled stock
+      # PostgreSQL image does not include it.
       enabled: false
       # Delay between scheduled scans for missing or stale embeddings.
       intervalSeconds: 300
@@ -849,6 +852,12 @@ teamsbot:
 
 postgres:
   enabled: true
+  # Selects the migration and search implementation. ParadeDB is the default;
+  # use `postgresql` with an external Aurora/RDS database or a stock image.
+  profile: paradedb
+  # Set enabled=false when DATABASE_URL and IRON_CONTROL_DATABASE_URL point to
+  # an externally managed database. Network policies then permit outbound
+  # PostgreSQL traffic on port 5432.
   # Scheduling for the PostgreSQL pod. When persistence is enabled, ensure the
   # selected node pool can mount the configured storage class. Changing these
   # settings rolls the pod but does not delete its PVC.

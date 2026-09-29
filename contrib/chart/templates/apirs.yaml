@@ -261,6 +261,10 @@ spec:
 {{- end }}
             - name: RUN_MIGRATIONS
               value: {{ .Values.apiRs.runMigrations | quote }}
+{{- if not (hasKey .Values.apiRs.extraEnv "CENTAUR_DATABASE_PROFILE") }}
+            - name: CENTAUR_DATABASE_PROFILE
+              value: {{ .Values.postgres.profile | quote }}
+{{- end }}
 {{- if not (hasKey .Values.apiRs.extraEnv "CENTAUR_SESSION_PRINCIPAL_ADMISSION") }}
             - name: CENTAUR_SESSION_PRINCIPAL_ADMISSION
               value: {{ .Values.apiRs.sessionPrincipalAdmission | quote }}
@@ -474,6 +478,9 @@ spec:
             - name: KUBERNETES_IRON_PROXY_HARNESS_ENGINE
               value: {{ .Values.sandbox.harnessEngine | quote }}
 {{- $sandboxEnvList := list }}
+{{- if not (hasKey .Values.sandbox.extraEnv "CENTAUR_DATABASE_PROFILE") }}
+{{- $sandboxEnvList = append $sandboxEnvList (dict "name" "CENTAUR_DATABASE_PROFILE" "value" .Values.postgres.profile) }}
+{{- end }}
 {{- if and .Values.repoCache.enabled (gt (len $skillDirs) 0) }}
 {{- $sandboxEnvList = append $sandboxEnvList (dict "name" "CENTAUR_SKILL_DIRS" "value" (join ":" $skillDirs)) }}
 {{- end }}

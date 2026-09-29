@@ -144,6 +144,11 @@ spec:
       ports:
         - protocol: TCP
           port: 5432
+{{- else }}
+    # The database is externally managed (for example, Aurora or RDS).
+    - ports:
+        - protocol: TCP
+          port: 5432
 {{- end }}
     # Trusted workflow code may make direct outbound HTTPS calls (mirrors api-rs).
     - ports:
@@ -334,6 +339,11 @@ spec:
       ports:
         - protocol: TCP
           port: 5432
+{{- else }}
+    # The database is externally managed (for example, Aurora or RDS).
+    - ports:
+        - protocol: TCP
+          port: 5432
 {{- end }}
     # Per-sandbox iron-proxy listeners (HTTP proxy + postgres + management API).
     - to:
@@ -408,6 +418,11 @@ spec:
       ports:
         - protocol: TCP
           port: 5432
+{{- else }}
+    # The database is externally managed (for example, Aurora or RDS).
+    - ports:
+        - protocol: TCP
+          port: 5432
 {{- end }}
     # Slack API egress (direct HTTPS; slackbotv2 does not use the firewall proxy).
     - ports:
@@ -457,6 +472,11 @@ spec:
       ports:
         - protocol: TCP
           port: 5432
+{{- else }}
+    # The database is externally managed (for example, Aurora or RDS).
+    - ports:
+        - protocol: TCP
+          port: 5432
 {{- end }}
     # Linear GraphQL API egress (direct HTTPS; linearbot does not use the firewall proxy).
     - ports:
@@ -504,6 +524,11 @@ spec:
             matchLabels:
 {{ include "centaur.componentSelectorLabels" (dict "root" . "component" "postgres") | nindent 14 }}
       ports:
+        - protocol: TCP
+          port: 5432
+{{- else }}
+    # The database is externally managed (for example, Aurora or RDS).
+    - ports:
         - protocol: TCP
           port: 5432
 {{- end }}
@@ -556,6 +581,11 @@ spec:
       ports:
         - protocol: TCP
           port: 5432
+{{- else }}
+    # The database is externally managed (for example, Aurora or RDS).
+    - ports:
+        - protocol: TCP
+          port: 5432
 {{- end }}
     # Discord Gateway (wss), REST, and CDN all need direct HTTPS egress. The Gateway cannot be
     # proxied (discord.js ignores HTTPS_PROXY), so this rule is load-bearing.
@@ -604,6 +634,11 @@ spec:
             matchLabels:
 {{ include "centaur.componentSelectorLabels" (dict "root" . "component" "postgres") | nindent 14 }}
       ports:
+        - protocol: TCP
+          port: 5432
+{{- else }}
+    # The database is externally managed (for example, Aurora or RDS).
+    - ports:
         - protocol: TCP
           port: 5432
 {{- end }}

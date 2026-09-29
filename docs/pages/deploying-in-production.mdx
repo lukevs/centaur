@@ -89,6 +89,25 @@ The bootstrap user is created only when the Console has no users. Do not rotate
 the ActiveRecord encryption keys as an ordinary credential rotation: existing
 encrypted records become unreadable without an explicit key-migration plan.
 
+### Aurora and RDS PostgreSQL
+
+ParadeDB is Centaur's default database profile. To use Aurora PostgreSQL or RDS
+for PostgreSQL instead, set `postgres.enabled=false` and
+`postgres.profile=postgresql`, then point `DATABASE_URL` and
+`IRON_CONTROL_DATABASE_URL` at separately provisioned logical databases. The
+PostgreSQL profile uses its own SQLx migration tree and built-in full-text search
+with GIN indexes. A database is pinned to the profile that first migrated it;
+changing profiles requires an explicit data migration.
+
+The database user used during startup must be able to run Centaur's migrations.
+The Console also expects its primary, cache, queue, and cable databases to exist
+or be creatable by its initialization container.
+
+Hybrid semantic search is optional. When
+`apiRs.etl.companyContextEmbeddings.enabled=true`, install the AWS-supported
+`vector` extension (pgvector) in the API database before the first migration
+run. Leave the setting disabled for an extension-free PostgreSQL installation.
+
 Generate distinct high-entropy values for each enabled ingress service key.
 Store them in the infra Secret. api-rs rejects duplicate configured tokens at
 startup.

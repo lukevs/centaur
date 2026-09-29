@@ -5,9 +5,12 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
+use centaur_session_sqlx::DatabaseProfile;
 use sqlx::{Connection, Executor, PgConnection, Row, postgres::PgConnectOptions};
 
-static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations/paradedb");
+static PARADEDB_MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations/paradedb");
+static POSTGRESQL_MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations/postgresql");
+
 static RLS_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 #[derive(Debug, PartialEq, Eq)]
@@ -91,6 +94,9 @@ async fn company_context_embeddings_support_shared_etl_writes_and_scoped_reads()
     let Some(mut fixture) = RlsTestFixture::create().await? else {
         return Ok(());
     };
+    if !relation_exists(&mut fixture.conn, "company_context_document_embeddings").await? {
+        return fixture.finish(Ok(())).await;
+    }
     let result = assert_company_context_embedding_access(&mut fixture.conn)
         .await
         .map_err(Into::into);
@@ -332,7 +338,10 @@ async fn assert_multiterm_granola_keyword_score(
     let rows = granola_keyword_search_rows(conn, "viewer@example.com").await?;
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].0, "granola:note:granola_note");
-    assert!(rows[0].1 > 0.0, "matching document must have a BM25 score");
+    assert!(
+        rows[0].1 > 0.0,
+        "matching document must have a full-text score"
+    );
     Ok(())
 }
 
@@ -399,7 +408,10 @@ impl RlsTestFixture {
         };
 
         let setup_result = async {
-            MIGRATOR.run(&mut conn).await?;
+            match DatabaseProfile::from_env()? {
+                DatabaseProfile::ParadeDb => PARADEDB_MIGRATOR.run(&mut conn).await?,
+                DatabaseProfile::PostgreSql => POSTGRESQL_MIGRATOR.run(&mut conn).await?,
+            }
             insert_fixture_rows(&mut conn).await?;
             Ok::<(), Box<dyn Error>>(())
         }
@@ -489,7 +501,11 @@ async fn assert_expected_policies(conn: &mut PgConnection) -> Result<(), sqlx::E
     .map(|row| (row.get("tablename"), row.get("policyname")))
     .collect();
 
+    let embeddings_available = relation_exists(conn, "company_context_document_embeddings").await?;
     for expected in expected_policies() {
+        if expected.0 == "company_context_document_embeddings" && !embeddings_available {
+            continue;
+        }
         assert!(
             policies.contains(&expected),
             "missing RLS policy {} on {}",
@@ -499,6 +515,13 @@ async fn assert_expected_policies(conn: &mut PgConnection) -> Result<(), sqlx::E
     }
 
     Ok(())
+}
+
+async fn relation_exists(conn: &mut PgConnection, relation: &str) -> Result<bool, sqlx::Error> {
+    sqlx::query_scalar("select to_regclass($1) is not null")
+        .bind(relation)
+        .fetch_one(conn)
+        .await
 }
 
 fn expected_policies() -> Vec<(String, String)> {
@@ -760,22 +783,24 @@ async fn assert_company_context_reader_role_security(
     )
     .fetch_all(&mut *conn)
     .await?;
+    let mut expected_relations = vec![
+        "company_context_documents".to_owned(),
+        "company_context_slack_messages".to_owned(),
+        "company_context_slack_users".to_owned(),
+        "google_docs_context_documents".to_owned(),
+        "google_docs_sync_file_observations".to_owned(),
+        "granola_context_documents".to_owned(),
+        "slack_private_context_documents".to_owned(),
+        "slack_private_conversation_context_documents".to_owned(),
+        "slack_sync_channels".to_owned(),
+        "slack_sync_messages".to_owned(),
+        "slack_sync_users".to_owned(),
+    ];
+    if relation_exists(conn, "company_context_document_embeddings").await? {
+        expected_relations.insert(0, "company_context_document_embeddings".to_owned());
+    }
     assert_eq!(
-        readable_relations,
-        vec![
-            "company_context_document_embeddings".to_owned(),
-            "company_context_documents".to_owned(),
-            "company_context_slack_messages".to_owned(),
-            "company_context_slack_users".to_owned(),
-            "google_docs_context_documents".to_owned(),
-            "google_docs_sync_file_observations".to_owned(),
-            "granola_context_documents".to_owned(),
-            "slack_private_context_documents".to_owned(),
-            "slack_private_conversation_context_documents".to_owned(),
-            "slack_sync_channels".to_owned(),
-            "slack_sync_messages".to_owned(),
-            "slack_sync_users".to_owned(),
-        ],
+        readable_relations, expected_relations,
         "company context reader gained effective access to an unexpected application table or view"
     );
 
@@ -1565,16 +1590,28 @@ async fn granola_keyword_search_rows(
 
     let rows = sqlx::query_as(
         r#"
-        select document_id, paradedb.score(document_id) as score
+        select document_id,
+            (
+            8 * ts_rank_cd(
+                to_tsvector('english', coalesce(title, '')),
+                phraseto_tsquery('english', $1)
+            )
+            + 2 * ts_rank_cd(
+                to_tsvector('english', coalesce(body, '')),
+                phraseto_tsquery('english', $1)
+            ))::real as score
         from granola_context_documents
         where (
-            (title ||| $1::text::pdb.boost(8) or body ||| $1::text::pdb.boost(2))
-            or (title ||| $2::text::pdb.boost(4) or body ||| $2::text)
-            or (title ||| $3::text::pdb.boost(4) or body ||| $3::text)
+            to_tsvector('english', coalesce(title, '') || ' ' || coalesce(body, ''))
+                @@ phraseto_tsquery('english', $1)
+            or to_tsvector('english', coalesce(title, '') || ' ' || coalesce(body, ''))
+                @@ plainto_tsquery('english', $2)
+            or to_tsvector('english', coalesce(title, '') || ' ' || coalesce(body, ''))
+                @@ plainto_tsquery('english', $3)
         )
         and ($4::timestamptz is null or occurred_at >= $4)
         and ($5::timestamptz is null or occurred_at < $5)
-        order by paradedb.score(document_id) desc
+        order by score desc
         limit $6
         "#,
     )

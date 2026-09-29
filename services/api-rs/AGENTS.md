@@ -42,10 +42,13 @@ Read the relevant RFC under `rfcs/` before changing a core protocol.
 
 ## Database changes
 
-Migrations live in `crates/centaur-session-sqlx/migrations/paradedb` and are
-embedded in the binary and tests. Add the next numbered SQL file; never edit or
-reorder an applied migration. Update SQLx repository code and add
-database-backed coverage for upgrade, read/write, and recovery behavior.
+Migrations live in the backend-specific
+`crates/centaur-session-sqlx/migrations/{paradedb,postgresql}` trees and are
+embedded in the binary and tests. Follow the migration README: add portable
+changes to both independently versioned trees, keep backend-specific changes in
+the relevant tree, and never edit or reorder an applied migration. Update SQLx
+repository code and add database-backed coverage for upgrade, read/write, and
+recovery behavior on both profiles.
 
 Database-backed tests skip when their URL is absent. Point these variables at a
 disposable Postgres as required by the packages you run:

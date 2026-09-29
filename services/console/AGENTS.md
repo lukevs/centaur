@@ -34,23 +34,21 @@ Use `README.md` and `docs/API.md` for the supported behavior and API shapes.
 
 ## Local database
 
-Console requires ParadeDB because its schema and skill search use the
-`pg_search` extension; stock Postgres is not sufficient. For local development,
-run ParadeDB in Docker from `services/console`:
+Console defaults to ParadeDB and also supports a stock PostgreSQL profile. For
+default local development, run ParadeDB from `services/console`:
 
 ```bash
 just paradedb
 ```
 
-This starts the pinned ParadeDB image on `127.0.0.1:55432` and keeps its data in
-a named Docker volume. `just dev` starts the same container automatically. When
-using an existing ParadeDB server, configure the `CENTAUR_CONSOLE_DB_*`
-variables and set `CENTAUR_CONSOLE_MANAGE_PARADEDB=false`; the server must make
-`pg_search` available to the Console database.
+This starts ParadeDB on `127.0.0.1:55432`; `just dev` starts it automatically.
+For stock PostgreSQL, run `just postgres`, set
+`CENTAUR_DATABASE_PROFILE=postgresql`, and run `bin/rails db:prepare`. The stock
+profile disables schema-dump loading and bootstraps from migrations.
 
 ## Validation
 
-From `services/console`, point Rails at the Docker ParadeDB instance before
+From `services/console`, point Rails at the selected database before
 running database tasks or tests:
 
 ```bash

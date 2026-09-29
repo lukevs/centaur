@@ -1,6 +1,6 @@
 class CreateSkills < ActiveRecord::Migration[8.1]
   def change
-    enable_extension "pg_search" unless extension_enabled?("pg_search")
+    enable_extension "pg_search" if paradedb_profile? && !extension_enabled?("pg_search")
 
     create_table :skills do |t|
       t.references :user, null: false, foreign_key: { on_delete: :cascade }
@@ -22,15 +22,32 @@ class CreateSkills < ActiveRecord::Migration[8.1]
 
     reversible do |direction|
       direction.up do
-        add_bm25_index :skills,
-                       fields: { id: {}, name: {}, description: {}, content: {} },
-                       key_field: :id,
-                       name: :index_skills_on_search_document
+        if paradedb_profile?
+          add_bm25_index :skills,
+                         fields: { id: {}, name: {}, description: {}, content: {} },
+                         key_field: :id,
+                         name: :index_skills_on_search_document
+        else
+          add_index :skills,
+                    "to_tsvector('english', coalesce(name, '') || ' ' || coalesce(description, '') || ' ' || coalesce(content, ''))",
+                    using: :gin,
+                    name: :index_skills_on_search_document
+        end
       end
 
       direction.down do
-        remove_bm25_index :skills, name: :index_skills_on_search_document, if_exists: true
+        if paradedb_profile?
+          remove_bm25_index :skills, name: :index_skills_on_search_document, if_exists: true
+        else
+          remove_index :skills, name: :index_skills_on_search_document, if_exists: true
+        end
       end
     end
+  end
+
+  private
+
+  def paradedb_profile?
+    DatabaseConfiguration.profile.equal?(DatabaseProfile::PARADEDB)
   end
 end

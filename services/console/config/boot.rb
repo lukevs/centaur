@@ -7,3 +7,5 @@ require "bootsnap/setup" # Speed up boot time by caching expensive operations.
 # fallback). Required this early so config/database.yml ERB and others can use it
 # before the app's autoloader is set up.
 require_relative "../lib/console_env"
+require_relative "../lib/database_profile"
+require_relative "../lib/database_configuration"

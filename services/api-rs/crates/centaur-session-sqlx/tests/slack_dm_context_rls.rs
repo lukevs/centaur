@@ -6,16 +6,17 @@ use std::{
 
 use sqlx::{Connection, Executor, PgConnection, Row};
 
-const SLACK_SYNC_SQL: &str = include_str!("../migrations/0011_slack_sync_tables.sql");
-const SLACK_DM_SYNC_SQL: &str = include_str!("../migrations/0027_slack_dm_sync_tables.sql");
+const SLACK_SYNC_SQL: &str = include_str!("../migrations/paradedb/0011_slack_sync_tables.sql");
+const SLACK_DM_SYNC_SQL: &str =
+    include_str!("../migrations/paradedb/0027_slack_dm_sync_tables.sql");
 const SLACK_DM_CONTEXT_DOCUMENTS_SQL: &str =
-    include_str!("../migrations/0028_slack_dm_context_documents.sql");
+    include_str!("../migrations/paradedb/0028_slack_dm_context_documents.sql");
 const SLACK_DM_CONVERSATION_CONTEXT_DOCUMENTS_SQL: &str =
-    include_str!("../migrations/0029_slack_dm_conversation_context_documents.sql");
+    include_str!("../migrations/paradedb/0029_slack_dm_conversation_context_documents.sql");
 const READONLY_DM_RLS_SQL: &str =
-    include_str!("../migrations/0042_centaur_readonly_slack_dm_rls.sql");
+    include_str!("../migrations/paradedb/0042_centaur_readonly_slack_dm_rls.sql");
 const SLACK_PRIVATE_CONVERSATIONS_SQL: &str =
-    include_str!("../migrations/0045_slack_private_channel_oauth_sync.sql");
+    include_str!("../migrations/paradedb/0045_slack_private_channel_oauth_sync.sql");
 
 const RLS_TABLES: &[&str] = &[
     "slack_dm_sync_conversations",

@@ -19,7 +19,7 @@ use time::{Duration as TimeDuration, OffsetDateTime};
 use uuid::Uuid;
 
 // The API binary embeds these migrations at compile time.
-static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
+static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations/paradedb");
 
 pub const SESSION_EVENTS_CHANNEL: &str = "centaur_session_events";
 const DEFAULT_MAX_CONNECTIONS: u32 = 500;

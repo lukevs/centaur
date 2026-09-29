@@ -6,9 +6,9 @@ use std::{
 
 use sqlx::{Connection, Executor, PgConnection, Row};
 
-const GRANOLA_SYNC_SQL: &str = include_str!("../migrations/0040_granola_sync_tables.sql");
+const GRANOLA_SYNC_SQL: &str = include_str!("../migrations/paradedb/0040_granola_sync_tables.sql");
 const GRANOLA_CONTEXT_PROJECTION_SQL: &str =
-    include_str!("../migrations/0044_granola_context_projection.sql");
+    include_str!("../migrations/paradedb/0044_granola_context_projection.sql");
 
 #[tokio::test]
 async fn granola_notes_project_into_their_dedicated_rls_protected_context_table()

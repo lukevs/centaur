@@ -64,6 +64,9 @@ impl IntoResponse for ApiError {
             Self::Runtime(SessionRuntimeError::Store(SessionStoreError::HarnessConflict {
                 ..
             })) => StatusCode::CONFLICT,
+            Self::Runtime(SessionRuntimeError::Store(SessionStoreError::AlreadyExists {
+                ..
+            })) => StatusCode::CONFLICT,
             Self::Runtime(SessionRuntimeError::Store(SessionStoreError::PrincipalConflict {
                 ..
             })) => StatusCode::CONFLICT,
@@ -159,6 +162,17 @@ mod tests {
     use super::*;
     use axum::body::to_bytes;
     use centaur_iron_control::{IronControlError, PrincipalDerivationError};
+
+    #[test]
+    fn duplicate_session_creation_is_a_conflict() {
+        let response = ApiError::Runtime(SessionRuntimeError::Store(
+            SessionStoreError::AlreadyExists {
+                thread_key: "cli:existing".to_owned(),
+            },
+        ))
+        .into_response();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+    }
 
     #[test]
     fn principal_derivation_errors_are_bad_requests() {

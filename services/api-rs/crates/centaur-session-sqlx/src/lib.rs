@@ -127,6 +127,28 @@ impl PgSessionStore {
             metadata,
             proxy_labels,
             false,
+            false,
+        )
+        .await
+    }
+
+    /// Create a new session, rejecting an existing thread key atomically.
+    pub async fn create_session(
+        &self,
+        thread_key: &ThreadKey,
+        harness_type: &HarnessType,
+        persona_id: Option<&str>,
+        metadata: Value,
+        proxy_labels: BTreeMap<String, String>,
+    ) -> Result<Session, SessionStoreError> {
+        self.create_or_get_session_inner(
+            thread_key,
+            harness_type,
+            persona_id,
+            metadata,
+            proxy_labels,
+            false,
+            true,
         )
         .await
     }
@@ -149,10 +171,12 @@ impl PgSessionStore {
             metadata,
             proxy_labels,
             true,
+            false,
         )
         .await
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn create_or_get_session_inner(
         &self,
         thread_key: &ThreadKey,
@@ -161,6 +185,7 @@ impl PgSessionStore {
         metadata: Value,
         proxy_labels: BTreeMap<String, String>,
         merge_metadata: bool,
+        require_new: bool,
     ) -> Result<Session, SessionStoreError> {
         let query = if merge_metadata {
             sqlx::query(
@@ -183,7 +208,7 @@ impl PgSessionStore {
                 "#,
             )
         };
-        query
+        let affected = query
             .bind(thread_key.as_str())
             .bind(harness_type.as_ref())
             .bind(persona_id)
@@ -191,7 +216,14 @@ impl PgSessionStore {
             .bind(metadata)
             .bind(Json(proxy_labels.clone()))
             .execute(&self.pool)
-            .await?;
+            .await?
+            .rows_affected();
+
+        if require_new && affected == 0 {
+            return Err(SessionStoreError::AlreadyExists {
+                thread_key: thread_key.to_string(),
+            });
+        }
 
         if !proxy_labels.is_empty() {
             sqlx::query(
@@ -1763,6 +1795,8 @@ pub struct SessionEventNotification {
 
 #[derive(Debug, Error)]
 pub enum SessionStoreError {
+    #[error("session already exists: {thread_key}")]
+    AlreadyExists { thread_key: String },
     #[error("session not found for thread_key {thread_key}")]
     NotFound { thread_key: String },
     #[error(
@@ -2223,6 +2257,60 @@ mod tests {
         .expect("candidate should use backstop");
 
         assert_eq!(candidate.idle_timeout, Duration::from_secs(1));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn concurrent_session_creation_has_exactly_one_winner() {
+        let Some(store) = test_store().await else {
+            return;
+        };
+        let thread_key = ThreadKey::parse(format!("test:create-race-{}", Uuid::new_v4())).unwrap();
+        let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(8));
+        let mut tasks = tokio::task::JoinSet::new();
+        for _ in 0..8 {
+            let store = store.clone();
+            let thread_key = thread_key.clone();
+            let barrier = barrier.clone();
+            tasks.spawn(async move {
+                barrier.wait().await;
+                store
+                    .create_session(
+                        &thread_key,
+                        &HarnessType::Codex,
+                        None,
+                        json!({}),
+                        BTreeMap::new(),
+                    )
+                    .await
+            });
+        }
+        let mut winners = 0;
+        while let Some(result) = tasks.join_next().await {
+            match result.unwrap() {
+                Ok(session) => {
+                    assert_eq!(session.thread_key, thread_key);
+                    winners += 1;
+                }
+                Err(super::SessionStoreError::AlreadyExists {
+                    thread_key: existing,
+                }) => {
+                    assert_eq!(existing, thread_key.as_str());
+                }
+                Err(error) => panic!("unexpected creation error: {error}"),
+            }
+        }
+        assert_eq!(winners, 1);
+        let reused = store
+            .create_or_get_session(
+                &thread_key,
+                &HarnessType::Codex,
+                None,
+                json!({}),
+                BTreeMap::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(reused.thread_key, thread_key);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

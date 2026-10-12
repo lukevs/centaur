@@ -1516,6 +1516,7 @@ impl SessionRuntime {
             on_harness_conflict,
             None,
             SessionPrincipalAdmission::Automatic,
+            false,
         )
         .await
     }
@@ -1539,6 +1540,7 @@ impl SessionRuntime {
             on_harness_conflict,
             None,
             self.session_principal_admission,
+            false,
         )
         .await
     }
@@ -1563,6 +1565,30 @@ impl SessionRuntime {
             on_harness_conflict,
             principal_foreign_id,
             SessionPrincipalAdmission::Automatic,
+            false,
+        )
+        .await
+    }
+
+    /// Create a new session bound to an existing principal. Unlike create-or-get,
+    /// an existing thread key is rejected without sending input or rebinding it.
+    pub async fn create_session_with_principal(
+        &self,
+        thread_key: &ThreadKey,
+        harness_type: &HarnessType,
+        persona_id: Option<&str>,
+        metadata: Option<Value>,
+        principal_foreign_id: &str,
+    ) -> Result<CreateOrGetSessionOutcome, SessionRuntimeError> {
+        self.create_or_get_session_with_principal_admission(
+            thread_key,
+            harness_type,
+            persona_id,
+            metadata,
+            HarnessConflictPolicy::Reject,
+            Some(principal_foreign_id),
+            SessionPrincipalAdmission::Automatic,
+            true,
         )
         .await
     }
@@ -1577,6 +1603,7 @@ impl SessionRuntime {
         on_harness_conflict: HarnessConflictPolicy,
         principal_foreign_id: Option<&str>,
         admission: SessionPrincipalAdmission,
+        require_new: bool,
     ) -> Result<CreateOrGetSessionOutcome, SessionRuntimeError> {
         let principal_foreign_id = match principal_foreign_id {
             Some(foreign_id) if foreign_id.trim().is_empty() => {
@@ -1644,17 +1671,28 @@ impl SessionRuntime {
             if let Some(context) = persona_resolution.context.as_ref() {
                 add_persona_metadata(&mut session_metadata, context);
             }
-            match self
-                .store
-                .create_or_get_session(
-                    thread_key,
-                    harness_type,
-                    persona_resolution.persona_id.as_deref(),
-                    session_metadata.clone(),
-                    proxy_labels.clone(),
-                )
-                .await
-            {
+            let creation = if require_new {
+                self.store
+                    .create_session(
+                        thread_key,
+                        harness_type,
+                        persona_resolution.persona_id.as_deref(),
+                        session_metadata.clone(),
+                        proxy_labels.clone(),
+                    )
+                    .await
+            } else {
+                self.store
+                    .create_or_get_session(
+                        thread_key,
+                        harness_type,
+                        persona_resolution.persona_id.as_deref(),
+                        session_metadata.clone(),
+                        proxy_labels.clone(),
+                    )
+                    .await
+            };
+            match creation {
                 Ok(session) => session,
                 Err(SessionStoreError::HarnessConflict { existing, .. })
                     if on_harness_conflict == HarnessConflictPolicy::Restart =>
@@ -9866,16 +9904,42 @@ mod adoption_tests {
         let runtime = runtime_with(&store, backend);
 
         let outcome = runtime
+            .create_session_with_principal(
+                &thread_key,
+                &HarnessType::Codex,
+                None,
+                Some(json!({})),
+                " finance-automation ",
+            )
+            .await
+            .expect("create session with selected principal");
+
+        let duplicate = runtime
+            .create_session_with_principal(
+                &thread_key,
+                &HarnessType::Codex,
+                None,
+                Some(json!({})),
+                "finance-automation",
+            )
+            .await
+            .expect_err("pure create rejects existing session");
+        assert!(matches!(
+            duplicate,
+            SessionRuntimeError::Store(SessionStoreError::AlreadyExists { .. })
+        ));
+        let reused = runtime
             .create_or_get_session_with_principal(
                 &thread_key,
                 &HarnessType::Codex,
                 None,
                 Some(json!({})),
                 HarnessConflictPolicy::Reject,
-                Some(" finance-automation "),
+                Some("finance-automation"),
             )
             .await
-            .expect("create session with selected principal");
+            .expect("reuse session with selected principal");
+        assert_eq!(reused.session.thread_key, thread_key);
 
         assert_eq!(
             outcome.session.iron_control_principal.as_deref(),

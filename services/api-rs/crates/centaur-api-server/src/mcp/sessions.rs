@@ -15,7 +15,7 @@ use centaur_session_core::{
     ThreadKey,
 };
 use centaur_session_runtime::{
-    ExecuteSessionInput, HarnessConflictPolicy, SESSION_OUTPUT_LINE_EVENT, SessionRuntimeError,
+    ExecuteSessionInput, SESSION_OUTPUT_LINE_EVENT, SessionRuntimeError,
 };
 use centaur_session_sqlx::SessionStoreError;
 use futures_util::{StreamExt as _, pin_mut};
@@ -446,18 +446,9 @@ async fn session_new(
         Err(outcome) => return Ok(outcome),
     };
     let runtime = state.runtime()?;
-    match runtime.session(&thread_key).await {
-        Ok(_) => {
-            return Ok(tool_error(format!(
-                "session {name:?} already exists; use centaur_session_send to message it"
-            )));
-        }
-        Err(SessionRuntimeError::Store(SessionStoreError::NotFound { .. })) => {}
-        Err(error) => return Err(error.into()),
-    }
     let harness = args.harness.unwrap_or(HarnessType::Codex);
-    let outcome = runtime
-        .create_or_get_session_with_principal(
+    let outcome = match runtime
+        .create_session_with_principal(
             &thread_key,
             &harness,
             args.persona
@@ -465,10 +456,18 @@ async fn session_new(
                 .map(str::trim)
                 .filter(|p| !p.is_empty()),
             Some(mcp_session_metadata(principal, "create")),
-            HarnessConflictPolicy::Reject,
-            Some(&principal.principal_id),
+            &principal.principal_id,
         )
-        .await?;
+        .await
+    {
+        Ok(outcome) => outcome,
+        Err(SessionRuntimeError::Store(SessionStoreError::AlreadyExists { .. })) => {
+            return Ok(tool_error(format!(
+                "session {name:?} already exists; use centaur_session_send to message it"
+            )));
+        }
+        Err(error) => return Err(error.into()),
+    };
     let (execution_id, status) =
         send_turn(state, principal, &thread_key, &args.prompt, "new").await?;
     record_mcp_tool_correlation(&Span::current(), None, Some(&execution_id), None);

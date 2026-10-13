@@ -187,9 +187,9 @@ impl PgSessionStore {
         persona_id: Option<&str>,
         metadata: Value,
         proxy_labels: BTreeMap<String, String>,
-        existing_session: ExistingSessionPolicy,
+        existing_session_policy: ExistingSessionPolicy,
     ) -> Result<Session, SessionStoreError> {
-        let query = if existing_session == ExistingSessionPolicy::ReuseMergingMetadata {
+        let query = if existing_session_policy == ExistingSessionPolicy::ReuseMergingMetadata {
             sqlx::query(
                 r#"
                 insert into sessions (thread_key, harness_type, persona_id, status, metadata, proxy_labels)
@@ -221,7 +221,7 @@ impl PgSessionStore {
             .await?
             .rows_affected();
 
-        if existing_session == ExistingSessionPolicy::Reject && affected == 0 {
+        if existing_session_policy == ExistingSessionPolicy::Reject && affected == 0 {
             return Err(SessionStoreError::AlreadyExists {
                 thread_key: thread_key.to_string(),
             });

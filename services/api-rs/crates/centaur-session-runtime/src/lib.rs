@@ -1609,7 +1609,7 @@ impl SessionRuntime {
         on_harness_conflict: HarnessConflictPolicy,
         principal_foreign_id: Option<&str>,
         admission: SessionPrincipalAdmission,
-        existing_session: ExistingSessionPolicy,
+        existing_session_policy: ExistingSessionPolicy,
     ) -> Result<CreateOrGetSessionOutcome, SessionRuntimeError> {
         let principal_foreign_id = match principal_foreign_id {
             Some(foreign_id) if foreign_id.trim().is_empty() => {
@@ -1677,7 +1677,7 @@ impl SessionRuntime {
             if let Some(context) = persona_resolution.context.as_ref() {
                 add_persona_metadata(&mut session_metadata, context);
             }
-            let creation = if existing_session == ExistingSessionPolicy::Reject {
+            let creation = if existing_session_policy == ExistingSessionPolicy::Reject {
                 self.store
                     .create_session(
                         thread_key,

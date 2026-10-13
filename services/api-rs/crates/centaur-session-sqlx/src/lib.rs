@@ -81,6 +81,13 @@ pub struct PgSessionStore {
     pool: PgPool,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ExistingSessionPolicy {
+    Reject,
+    Reuse,
+    ReuseMergingMetadata,
+}
+
 impl PgSessionStore {
     pub fn new(pool: PgPool) -> Self {
         Self { pool }
@@ -120,14 +127,13 @@ impl PgSessionStore {
         metadata: Value,
         proxy_labels: BTreeMap<String, String>,
     ) -> Result<Session, SessionStoreError> {
-        self.create_or_get_session_inner(
+        self.create_session_inner(
             thread_key,
             harness_type,
             persona_id,
             metadata,
             proxy_labels,
-            false,
-            false,
+            ExistingSessionPolicy::Reuse,
         )
         .await
     }
@@ -141,14 +147,13 @@ impl PgSessionStore {
         metadata: Value,
         proxy_labels: BTreeMap<String, String>,
     ) -> Result<Session, SessionStoreError> {
-        self.create_or_get_session_inner(
+        self.create_session_inner(
             thread_key,
             harness_type,
             persona_id,
             metadata,
             proxy_labels,
-            false,
-            true,
+            ExistingSessionPolicy::Reject,
         )
         .await
     }
@@ -164,30 +169,27 @@ impl PgSessionStore {
         metadata: Value,
         proxy_labels: BTreeMap<String, String>,
     ) -> Result<Session, SessionStoreError> {
-        self.create_or_get_session_inner(
+        self.create_session_inner(
             thread_key,
             harness_type,
             persona_id,
             metadata,
             proxy_labels,
-            true,
-            false,
+            ExistingSessionPolicy::ReuseMergingMetadata,
         )
         .await
     }
 
-    #[allow(clippy::too_many_arguments)]
-    async fn create_or_get_session_inner(
+    async fn create_session_inner(
         &self,
         thread_key: &ThreadKey,
         harness_type: &HarnessType,
         persona_id: Option<&str>,
         metadata: Value,
         proxy_labels: BTreeMap<String, String>,
-        merge_metadata: bool,
-        require_new: bool,
+        existing_session: ExistingSessionPolicy,
     ) -> Result<Session, SessionStoreError> {
-        let query = if merge_metadata {
+        let query = if existing_session == ExistingSessionPolicy::ReuseMergingMetadata {
             sqlx::query(
                 r#"
                 insert into sessions (thread_key, harness_type, persona_id, status, metadata, proxy_labels)
@@ -219,7 +221,7 @@ impl PgSessionStore {
             .await?
             .rows_affected();
 
-        if require_new && affected == 0 {
+        if existing_session == ExistingSessionPolicy::Reject && affected == 0 {
             return Err(SessionStoreError::AlreadyExists {
                 thread_key: thread_key.to_string(),
             });

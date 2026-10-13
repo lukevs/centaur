@@ -357,6 +357,12 @@ pub enum HarnessConflictPolicy {
     Restart,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ExistingSessionPolicy {
+    Reject,
+    Reuse,
+}
+
 /// Result of [`SessionRuntime::create_or_get_session`].
 #[derive(Clone, Debug)]
 pub struct CreateOrGetSessionOutcome {
@@ -1508,7 +1514,7 @@ impl SessionRuntime {
         metadata: Option<Value>,
         on_harness_conflict: HarnessConflictPolicy,
     ) -> Result<CreateOrGetSessionOutcome, SessionRuntimeError> {
-        self.create_or_get_session_with_principal_admission(
+        self.create_session_inner(
             thread_key,
             harness_type,
             persona_id,
@@ -1516,7 +1522,7 @@ impl SessionRuntime {
             on_harness_conflict,
             None,
             SessionPrincipalAdmission::Automatic,
-            false,
+            ExistingSessionPolicy::Reuse,
         )
         .await
     }
@@ -1532,7 +1538,7 @@ impl SessionRuntime {
         metadata: Option<Value>,
         on_harness_conflict: HarnessConflictPolicy,
     ) -> Result<CreateOrGetSessionOutcome, SessionRuntimeError> {
-        self.create_or_get_session_with_principal_admission(
+        self.create_session_inner(
             thread_key,
             harness_type,
             persona_id,
@@ -1540,7 +1546,7 @@ impl SessionRuntime {
             on_harness_conflict,
             None,
             self.session_principal_admission,
-            false,
+            ExistingSessionPolicy::Reuse,
         )
         .await
     }
@@ -1557,7 +1563,7 @@ impl SessionRuntime {
         on_harness_conflict: HarnessConflictPolicy,
         principal_foreign_id: Option<&str>,
     ) -> Result<CreateOrGetSessionOutcome, SessionRuntimeError> {
-        self.create_or_get_session_with_principal_admission(
+        self.create_session_inner(
             thread_key,
             harness_type,
             persona_id,
@@ -1565,7 +1571,7 @@ impl SessionRuntime {
             on_harness_conflict,
             principal_foreign_id,
             SessionPrincipalAdmission::Automatic,
-            false,
+            ExistingSessionPolicy::Reuse,
         )
         .await
     }
@@ -1580,7 +1586,7 @@ impl SessionRuntime {
         metadata: Option<Value>,
         principal_foreign_id: &str,
     ) -> Result<CreateOrGetSessionOutcome, SessionRuntimeError> {
-        self.create_or_get_session_with_principal_admission(
+        self.create_session_inner(
             thread_key,
             harness_type,
             persona_id,
@@ -1588,13 +1594,13 @@ impl SessionRuntime {
             HarnessConflictPolicy::Reject,
             Some(principal_foreign_id),
             SessionPrincipalAdmission::Automatic,
-            true,
+            ExistingSessionPolicy::Reject,
         )
         .await
     }
 
     #[allow(clippy::too_many_arguments)]
-    async fn create_or_get_session_with_principal_admission(
+    async fn create_session_inner(
         &self,
         thread_key: &ThreadKey,
         harness_type: &HarnessType,
@@ -1603,7 +1609,7 @@ impl SessionRuntime {
         on_harness_conflict: HarnessConflictPolicy,
         principal_foreign_id: Option<&str>,
         admission: SessionPrincipalAdmission,
-        require_new: bool,
+        existing_session: ExistingSessionPolicy,
     ) -> Result<CreateOrGetSessionOutcome, SessionRuntimeError> {
         let principal_foreign_id = match principal_foreign_id {
             Some(foreign_id) if foreign_id.trim().is_empty() => {
@@ -1671,7 +1677,7 @@ impl SessionRuntime {
             if let Some(context) = persona_resolution.context.as_ref() {
                 add_persona_metadata(&mut session_metadata, context);
             }
-            let creation = if require_new {
+            let creation = if existing_session == ExistingSessionPolicy::Reject {
                 self.store
                     .create_session(
                         thread_key,

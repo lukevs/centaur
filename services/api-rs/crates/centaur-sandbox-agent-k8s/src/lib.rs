@@ -26,11 +26,13 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite};
 use tokio::sync::Mutex;
 use tokio::time::{Instant, sleep};
 
+pub use dind::DindConfig;
 pub use generated::agents_x_k8s_io as crd;
 pub use iron_proxy::IronProxyConfig;
 pub use k8s_openapi::api::core::v1::Toleration;
 pub use tools::{GitHubTokenRef, ToolSource, ToolsConfig};
 
+mod dind;
 pub mod generated;
 mod iron_proxy;
 mod tools;
@@ -97,6 +99,8 @@ pub struct AgentSandboxConfig {
     /// git-clones the tools repo into the agent's `/app/tools`, and `TOOL_DIRS`
     /// is set so the agent's shim installer finds them.
     pub tools: Option<ToolsConfig>,
+    /// Optional Docker-in-Docker daemon for newly created sandbox pods.
+    pub dind: Option<DindConfig>,
     /// In-cluster OTLP collector (e.g. Laminar) used for observability-capable
     /// sandboxes. Sandbox pod egress is granted by chart-level label policy;
     /// the per-sandbox proxy uses this target for its own explicit egress.
@@ -156,6 +160,7 @@ impl AgentSandboxConfig {
             iron_proxy: None,
             iron_control,
             tools: None,
+            dind: None,
             otlp_egress: None,
             ready_timeout: Duration::from_secs(60),
         }
@@ -1027,16 +1032,6 @@ fn build_agent_sandbox(
             upsert_env(&mut agent_env, &name, value);
         }
     }
-    insert_optional(
-        &mut container,
-        "env",
-        (!agent_env.is_empty()).then(|| {
-            agent_env
-                .iter()
-                .map(|(name, value)| json!({ "name": name, "value": value }))
-                .collect::<Vec<_>>()
-        }),
-    );
     insert_optional(&mut container, "workingDir", spec.working_dir.clone());
     insert_optional(&mut container, "resources", resources_json(spec));
 
@@ -1077,6 +1072,26 @@ fn build_agent_sandbox(
         volume_mounts.extend(tools::agent_volume_mounts_json(repo_cache_tools));
         volumes.extend(tools::volumes_json(repo_cache_tools));
     }
+    if let Some(dind) = &config.dind {
+        // A native sidecar starts before the agent and stops with it. Its
+        // startup probe gates the agent on an actually usable Docker daemon.
+        init_containers.push(dind::sidecar_json(
+            dind,
+            &mut agent_env,
+            &mut volumes,
+            &mut volume_mounts,
+        ));
+    }
+    insert_optional(
+        &mut container,
+        "env",
+        (!agent_env.is_empty()).then(|| {
+            agent_env
+                .iter()
+                .map(|(name, value)| json!({ "name": name, "value": value }))
+                .collect::<Vec<_>>()
+        }),
+    );
     insert_optional(
         &mut container,
         "volumeMounts",
@@ -1111,7 +1126,7 @@ fn build_agent_sandbox(
         "automountServiceAccountToken": false,
         "enableServiceLinks": false,
     });
-    if repo_cache_tools.is_some() {
+    if repo_cache_tools.is_some() || config.dind.is_some() {
         pod_spec["securityContext"] = tools::pod_security_context_json();
     }
     insert_optional(
@@ -1464,6 +1479,112 @@ mod tests {
 
         assert!(exceeded);
         assert_eq!(retained, b"abc");
+    }
+
+    #[test]
+    fn dind_is_opt_in() {
+        let config = AgentSandboxConfig::new("test", test_iron_control_settings());
+        let sandbox = build_agent_sandbox(
+            &SandboxId::new("asbx-test"),
+            &SandboxSpec::new("agent"),
+            &config,
+        )
+        .unwrap();
+        let pod = sandbox.spec.pod_template.spec;
+        assert!(pod.init_containers.is_none());
+        assert!(pod.volumes.is_none());
+        assert!(pod.containers[0].env.is_none());
+        assert!(pod.security_context.is_none());
+    }
+
+    #[test]
+    fn dind_shares_mounts_and_proxy_but_not_agent_credentials() {
+        let spec = SandboxSpec::new("agent")
+            .env("HTTPS_PROXY", "http://proxy:8080")
+            .env("NO_PROXY", "localhost,127.0.0.1")
+            .env("SSL_CERT_FILE", "/firewall-certs/ca-cert.pem")
+            .env("OPENAI_API_KEY", "placeholder")
+            .env("DOCKER_HOST", "tcp://wrong:2375")
+            .env("DOCKER_TLS_VERIFY", "1")
+            .env("DOCKER_CONTEXT", "wrong")
+            .mount(
+                centaur_sandbox_core::Mount::new(MountKind::EmptyDir, "/home/agent/github")
+                    .sub_path("public")
+                    .read_only(),
+            );
+        let mut config = AgentSandboxConfig::new("test", test_iron_control_settings())
+            .state_volume(StateVolumeConfig::new("/home/agent/state", "10Gi"));
+        config.dind = Some(DindConfig {
+            image: "docker:test-dind".to_owned(),
+            image_pull_policy: Some("Never".to_owned()),
+            resources: Some(ResourceRequirements::new().limit("memory", "2Gi")),
+        });
+        let sandbox = build_agent_sandbox(&SandboxId::new("asbx-test"), &spec, &config).unwrap();
+        let pod = serde_json::to_value(sandbox.spec.pod_template.spec).unwrap();
+        let agent = &pod["containers"][0];
+        let dind = &pod["initContainers"][0];
+        assert_eq!(dind["restartPolicy"], "Always");
+        assert_eq!(dind["image"], "docker:test-dind");
+        assert_eq!(dind["imagePullPolicy"], "Never");
+        assert_eq!(dind["resources"]["limits"]["memory"], "2Gi");
+        assert_eq!(dind["securityContext"]["privileged"], true);
+        assert_eq!(dind["securityContext"]["runAsUser"], 0);
+        assert!(agent.get("securityContext").is_none());
+        assert_eq!(pod["securityContext"]["fsGroup"], 1001);
+        assert_eq!(
+            dind["startupProbe"]["exec"]["command"],
+            json!(["docker", "info"])
+        );
+        assert_eq!(
+            dind["args"],
+            json!([
+                "dockerd",
+                "--host=unix:///run/centaur-docker/docker.sock",
+                "--group=1001"
+            ])
+        );
+        for mount in agent["volumeMounts"].as_array().unwrap() {
+            assert!(dind["volumeMounts"].as_array().unwrap().contains(mount));
+        }
+        let daemon_env = dind["env"].as_array().unwrap();
+        assert!(daemon_env.contains(&json!({"name": "HTTPS_PROXY", "value": "http://proxy:8080"})));
+        assert!(
+            daemon_env.contains(
+                &json!({"name": "SSL_CERT_FILE", "value": "/firewall-certs/ca-cert.pem"})
+            )
+        );
+        assert!(!daemon_env.iter().any(|env| env["name"] == "OPENAI_API_KEY"));
+        let agent_env = agent["env"].as_array().unwrap();
+        assert!(agent_env.contains(
+            &json!({"name": "DOCKER_HOST", "value": "unix:///run/centaur-docker/docker.sock"})
+        ));
+        assert!(
+            !agent_env
+                .iter()
+                .any(|env| env["name"] == "DOCKER_TLS_VERIFY" || env["name"] == "DOCKER_CONTEXT")
+        );
+    }
+
+    #[test]
+    fn dind_reuses_an_existing_workspace_mount() {
+        let spec = SandboxSpec::new("agent").mount(centaur_sandbox_core::Mount::new(
+            MountKind::EmptyDir,
+            "/home/agent",
+        ));
+        let mut config = AgentSandboxConfig::new("test", test_iron_control_settings());
+        config.dind = Some(DindConfig::default());
+        let sandbox = build_agent_sandbox(&SandboxId::new("asbx-test"), &spec, &config).unwrap();
+        let mounts = sandbox.spec.pod_template.spec.containers[0]
+            .volume_mounts
+            .as_ref()
+            .unwrap();
+        assert_eq!(
+            mounts
+                .iter()
+                .filter(|mount| mount.mount_path == "/home/agent/workspace")
+                .count(),
+            0
+        );
     }
 
     #[test]

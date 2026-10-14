@@ -41,6 +41,12 @@ context (no privilege escalation, all capabilities dropped). Code
 that runs in the sandbox cannot reach other sandboxes' filesystems,
 processes, or networking.
 
+The optional `sandbox.dind.enabled` setting adds a privileged Docker daemon
+sidecar. Sandbox code can control that daemon, which weakens the isolation
+boundary described above. It is disabled by default and should run on a
+dedicated node pool that permits privileged workloads. See
+[Docker Compose inside sandboxes](/deploying-in-production#run-docker-compose-inside-sandboxes).
+
 ### Network policy
 
 The Helm chart applies a default-deny NetworkPolicy to every pod in

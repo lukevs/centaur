@@ -24,8 +24,8 @@ use centaur_iron_proxy::{
     harness_auth_fragment, infra_fragment,
 };
 use centaur_sandbox_agent_k8s::{
-    AgentSandboxBackend, AgentSandboxConfig, GitHubTokenRef, IronControlSettings, IronProxyConfig,
-    OtlpEgressTarget, Toleration, ToolSource, ToolsConfig,
+    AgentSandboxBackend, AgentSandboxConfig, DindConfig, GitHubTokenRef, IronControlSettings,
+    IronProxyConfig, OtlpEgressTarget, Toleration, ToolSource, ToolsConfig,
 };
 use centaur_sandbox_core::{Mount, MountKind, ResourceRequirements, SandboxSpec};
 use centaur_sandbox_local::LocalSandboxBackend;
@@ -800,6 +800,8 @@ struct SandboxArgs {
     )]
     priority_class_name: Option<String>,
     #[command(flatten)]
+    dind: DindArgs,
+    #[command(flatten)]
     tools: ToolDiscoveryArgs,
     #[command(flatten)]
     iron_proxy: IronProxyArgs,
@@ -904,6 +906,11 @@ impl SandboxArgs {
     }
 
     async fn runtime(&self) -> Result<SandboxRuntime, ServerError> {
+        if self.dind.enabled && matches!(self.backend, SandboxBackendKind::Local) {
+            return Err(ServerError::UnsupportedConfig(
+                "Docker-in-Docker requires --session-sandbox-backend agent-k8s".to_owned(),
+            ));
+        }
         match self.backend {
             SandboxBackendKind::Local => Ok(SandboxRuntime::backend_with_workload(
                 Arc::new(LocalSandboxBackend::new()),
@@ -1639,6 +1646,7 @@ impl TryFrom<&SandboxArgs> for AgentSandboxConfig {
             .filter(|name| !name.is_empty())
             .map(str::to_owned);
         config.ready_timeout = Duration::from_secs(args.ready_timeout_secs);
+        config.dind = args.dind.to_config()?;
         let mut proxy = args.iron_proxy.to_config()?;
         let mut fragments = vec![args.iron_proxy.infra_fragment()?];
         if let Some(tool_fragment) = args.discover_tool_proxy_fragment()? {
@@ -1652,6 +1660,62 @@ impl TryFrom<&SandboxArgs> for AgentSandboxConfig {
         // per-sandbox proxy's own in-cluster OTLP egress explicit.
         config.otlp_egress = args.sandbox_otlp_egress_target()?;
         Ok(config)
+    }
+}
+
+#[derive(Debug, ClapArgs)]
+struct DindArgs {
+    /// Start newly created sandbox pods with a privileged Docker daemon sidecar.
+    #[arg(
+        id = "dind_enabled",
+        long = "session-sandbox-dind-enabled",
+        env = "SESSION_SANDBOX_DIND_ENABLED",
+        default_value_t = false,
+        action = clap::ArgAction::Set
+    )]
+    enabled: bool,
+    #[arg(
+        id = "dind_image",
+        long = "session-sandbox-dind-image",
+        env = "SESSION_SANDBOX_DIND_IMAGE"
+    )]
+    image: Option<String>,
+    #[arg(
+        id = "dind_image_pull_policy",
+        long = "session-sandbox-dind-image-pull-policy",
+        env = "SESSION_SANDBOX_DIND_IMAGE_PULL_POLICY"
+    )]
+    image_pull_policy: Option<String>,
+    /// Sidecar resources as a JSON Kubernetes ResourceRequirements object.
+    #[arg(
+        id = "dind_resources_json",
+        long = "session-sandbox-dind-resources",
+        env = "SESSION_SANDBOX_DIND_RESOURCES"
+    )]
+    resources_json: Option<String>,
+}
+
+impl DindArgs {
+    fn to_config(&self) -> Result<Option<DindConfig>, ServerError> {
+        if !self.enabled {
+            return Ok(None);
+        }
+        let mut config = DindConfig::default();
+        if let Some(image) = &self.image {
+            config.image = clean_optional_value(Some(image)).ok_or_else(|| {
+                ServerError::UnsupportedConfig(
+                    "SESSION_SANDBOX_DIND_IMAGE must not be blank".to_owned(),
+                )
+            })?;
+        }
+        if let Some(policy) = &self.image_pull_policy {
+            config.image_pull_policy = clean_optional_value(Some(policy));
+        }
+        config.resources = resource_requirements(
+            self.resources_json.as_deref(),
+            "SESSION_SANDBOX_DIND_RESOURCES",
+        )?;
+        Ok(Some(config))
     }
 }
 
@@ -2674,6 +2738,78 @@ mod tests {
 
         assert_eq!(args.sandbox.backend, SandboxBackendKind::AgentK8s);
         assert_eq!(args.sandbox.k8s_namespace, "centaur-test");
+    }
+
+    #[test]
+    fn dind_config_is_opt_in_and_accepts_image_and_resources() {
+        let defaults = Args::try_parse_from([
+            "centaur-api-server",
+            "--database-url",
+            "postgres://localhost/test",
+        ])
+        .unwrap();
+        assert!(defaults.sandbox.dind.to_config().unwrap().is_none());
+        let args = Args::try_parse_from([
+            "centaur-api-server",
+            "--database-url",
+            "postgres://localhost/test",
+            "--iron-control-url",
+            "http://console.local",
+            "--iron-control-api-key",
+            "iak_test",
+            "--session-sandbox-dind-enabled",
+            "true",
+            "--session-sandbox-dind-image",
+            "docker:custom-dind",
+            "--session-sandbox-dind-image-pull-policy",
+            "Never",
+            "--session-sandbox-dind-resources",
+            r#"{"limits":{"memory":"3Gi"}}"#,
+        ])
+        .unwrap();
+        let config = AgentSandboxConfig::try_from(&args.sandbox).unwrap();
+        let dind = config.dind.unwrap();
+        assert_eq!(dind.image, "docker:custom-dind");
+        assert_eq!(dind.image_pull_policy.as_deref(), Some("Never"));
+        assert_eq!(dind.resources.unwrap().limits["memory"], "3Gi");
+    }
+
+    #[test]
+    fn dind_config_rejects_blank_image_and_malformed_resources() {
+        for (flag, value) in [
+            ("--session-sandbox-dind-image", "  "),
+            ("--session-sandbox-dind-resources", "not-json"),
+        ] {
+            let args = Args::try_parse_from([
+                "centaur-api-server",
+                "--database-url",
+                "postgres://localhost/test",
+                "--session-sandbox-dind-enabled",
+                "true",
+                flag,
+                value,
+            ])
+            .unwrap();
+            assert!(args.sandbox.dind.to_config().is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn local_backend_rejects_dind() {
+        let args = Args::try_parse_from([
+            "centaur-api-server",
+            "--database-url",
+            "postgres://localhost/test",
+            "--session-sandbox-backend",
+            "local",
+            "--session-sandbox-dind-enabled",
+            "true",
+        ])
+        .unwrap();
+        assert!(matches!(
+            args.sandbox.runtime().await,
+            Err(ServerError::UnsupportedConfig(_))
+        ));
     }
 
     #[test]

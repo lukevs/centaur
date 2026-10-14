@@ -447,6 +447,68 @@ sandbox:
 Malformed selector/toleration JSON fails api-rs startup. Empty values keep
 default scheduling.
 
+### Run Docker Compose Inside Sandboxes
+
+Enable the optional Docker-in-Docker sidecar through the same runtime
+configuration path as sandbox scheduling:
+
+```yaml
+sandbox:
+  dind:
+    enabled: true
+    image:
+      repository: docker
+      tag: 29.9.0-dind
+      pullPolicy: IfNotPresent
+    resources:
+      requests:
+        cpu: 100m
+        memory: 256Mi
+        ephemeral-storage: 1Gi
+      limits:
+        memory: 2Gi
+        ephemeral-storage: 10Gi
+```
+
+The chart passes `SESSION_SANDBOX_DIND_ENABLED`, `SESSION_SANDBOX_DIND_IMAGE`,
+`SESSION_SANDBOX_DIND_IMAGE_PULL_POLICY`, and `SESSION_SANDBOX_DIND_RESOURCES`
+to api-rs. This is disabled by default and applies to newly created session,
+warm-pool, and workflow-host sandbox pods. Existing sandboxes keep their pod
+templates; recreate them to apply a change. The local process backend does not
+support DinD.
+
+The sidecar runs a privileged daemon, so the node policy and RuntimeClass must
+support privileged containers. Enabling it gives sandbox code access to that
+daemon and weakens the sandbox's isolation boundary; use a suitable dedicated
+node pool. It requires Kubernetes native sidecar support (stable in 1.33).
+
+The agent stays non-root and uses `DOCKER_HOST` pointing at a shared Unix socket;
+the daemon has no TCP API listener and does not mount the node's Docker socket.
+Startup waits for `docker info` to succeed. The sandbox image includes Compose
+and Buildx, so `docker compose up --build -d` works from the workspace, and
+published ports are reachable on `localhost` from the agent container.
+
+The default `/home/agent/workspace` and existing sandbox volume mounts are shared
+at identical paths with the daemon, allowing Compose bind mounts to resolve.
+Files elsewhere in the agent image's filesystem are not visible to the daemon;
+keep bind-mount sources in shared directories. Docker images, containers, and
+named volumes use pod-local ephemeral storage and are lost on pause/resume or
+pod replacement. Workspace persistence continues to follow its configured
+volume. Daemon image pulls inherit the sandbox's proxy and CA configuration;
+containers started by Compose still need their own proxy/CA settings for
+outbound requests, including during builds.
+
+After loading the updated sandbox image into a local cluster with the sandbox
+controller installed, run the regression test from `services/api-rs` using an
+existing, isolated test namespace:
+
+```bash
+SANDBOX_E2E_K8S_CONTEXT=<local-context> \
+SANDBOX_E2E_K8S_NAMESPACE=<test-namespace> \
+SANDBOX_E2E_DIND_AGENT_IMAGE=<sandbox-image> \
+cargo test -p centaur-sandbox-e2e --test dind -- --ignored --nocapture
+```
+
 ## 7. Verify the Deployment
 
 Check health from inside the api-rs deployment first:

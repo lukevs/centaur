@@ -407,6 +407,23 @@ spec:
             - name: SESSION_SANDBOX_PRIORITY_CLASS_NAME
               value: {{ .Values.sandbox.priorityClassName | quote }}
 {{- end }}
+            # Optional sidecar settings reach sandbox pods through api-rs.
+{{- if not (hasKey .Values.apiRs.extraEnv "SESSION_SANDBOX_DIND_ENABLED") }}
+            - name: SESSION_SANDBOX_DIND_ENABLED
+              value: {{ .Values.sandbox.dind.enabled | quote }}
+{{- end }}
+{{- if not (hasKey .Values.apiRs.extraEnv "SESSION_SANDBOX_DIND_IMAGE") }}
+            - name: SESSION_SANDBOX_DIND_IMAGE
+              value: {{ printf "%s:%s" .Values.sandbox.dind.image.repository .Values.sandbox.dind.image.tag | quote }}
+{{- end }}
+{{- if not (hasKey .Values.apiRs.extraEnv "SESSION_SANDBOX_DIND_IMAGE_PULL_POLICY") }}
+            - name: SESSION_SANDBOX_DIND_IMAGE_PULL_POLICY
+              value: {{ .Values.sandbox.dind.image.pullPolicy | quote }}
+{{- end }}
+{{- if and .Values.sandbox.dind.resources (not (hasKey .Values.apiRs.extraEnv "SESSION_SANDBOX_DIND_RESOURCES")) }}
+            - name: SESSION_SANDBOX_DIND_RESOURCES
+              value: {{ toJson .Values.sandbox.dind.resources | quote }}
+{{- end }}
             # Sandboxes call back into this control plane via the in-cluster Service.
             - name: SESSION_SANDBOX_CENTAUR_API_URL
               value: {{ printf "http://%s:%v" $apiRsName .Values.apiRs.port | quote }}

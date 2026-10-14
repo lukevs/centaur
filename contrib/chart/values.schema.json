@@ -257,6 +257,21 @@
         "tolerations": { "type": "array" },
         "runtimeClassName": { "type": "string" },
         "serviceAccountName": { "type": "string" },
+        "dind": {
+          "type": "object",
+          "properties": {
+            "enabled": { "type": "boolean" },
+            "image": {
+              "type": "object",
+              "properties": {
+                "repository": { "type": "string", "minLength": 1 },
+                "tag": { "type": "string", "minLength": 1 },
+                "pullPolicy": { "type": "string", "enum": ["Always", "IfNotPresent", "Never"] }
+              }
+            },
+            "resources": { "type": "object" }
+          }
+        },
         "reposPath": { "type": "string" },
         "resources": { "type": "object" },
         "telemetry": {

@@ -359,6 +359,23 @@ sandbox:
   # workloads and let the kubelet/scheduler sacrifice them before the
   # control plane under node pressure.
   priorityClassName: ""
+  # Optional privileged Docker-in-Docker sidecar for new sandbox pods (including
+  # warm and workflow-host pods). Requires a runtime/node policy that permits
+  # privileged containers. Existing sandboxes retain their original pod template.
+  dind:
+    enabled: false
+    image:
+      repository: docker
+      tag: 29.9.0-dind
+      pullPolicy: IfNotPresent
+    resources:
+      requests:
+        cpu: 100m
+        memory: 256Mi
+        ephemeral-storage: 1Gi
+      limits:
+        memory: 2Gi
+        ephemeral-storage: 10Gi
   reposPath: ""
   # How the in-sandbox harness authenticates upstream. Single source of truth:
   # the control plane reads it to register the matching iron-proxy credential

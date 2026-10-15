@@ -19,9 +19,6 @@ use time::{Duration as TimeDuration, OffsetDateTime};
 use uuid::Uuid;
 
 mod migrations;
-mod turns;
-
-pub use turns::{NewSession, PreparedSessionTurn, SessionTurnInput};
 
 pub use migrations::{TextSearchBackend, migrate, migration_list};
 
@@ -89,6 +86,44 @@ enum ExistingSessionPolicy {
     Reject,
     Reuse,
     ReuseMergingMetadata,
+}
+
+pub struct NewSession<'a> {
+    pub thread_key: &'a ThreadKey,
+    pub harness_type: &'a HarnessType,
+    pub persona_id: Option<&'a str>,
+    pub principal_id: &'a str,
+    pub metadata: Value,
+    pub proxy_labels: BTreeMap<String, String>,
+}
+
+pub struct SessionTurnInput {
+    pub message: SessionMessageInput,
+    pub execution_metadata: Value,
+    pub request: Value,
+}
+
+/// A running turn stays locked until the input write finishes. Completion and
+/// another sender cannot change the routing decision midway through that write.
+pub struct SteeringSessionTurn {
+    pub execution: SessionExecution,
+    pub message_ids: Vec<String>,
+    transaction: sqlx::Transaction<'static, sqlx::Postgres>,
+}
+
+impl SteeringSessionTurn {
+    pub async fn commit(self) -> Result<SessionExecution, SessionStoreError> {
+        self.transaction.commit().await?;
+        Ok(self.execution)
+    }
+}
+
+pub enum PreparedSessionTurn {
+    Queued(SessionExecution),
+    Steering(SteeringSessionTurn),
+    /// The execution is queued or its driver has not written its initial input.
+    /// No message was appended; retry after allowing the driver to progress.
+    Starting,
 }
 
 impl PgSessionStore {
@@ -253,6 +288,125 @@ impl PgSessionStore {
             });
         }
         Ok(session)
+    }
+
+    async fn insert_owned_session(
+        conn: &mut sqlx::PgConnection,
+        input: NewSession<'_>,
+    ) -> Result<Session, SessionStoreError> {
+        let row = sqlx::query_as::<_, SessionRow>(
+            r#"insert into sessions
+                (thread_key, harness_type, persona_id, iron_control_principal, status, metadata, proxy_labels)
+            values ($1, $2, $3, $4, 'idle', $5, $6)
+            on conflict (thread_key) do nothing
+            returning thread_key, title, sandbox_id, sandbox_repo_cache_enabled, sandbox_repo_cache_access, sandbox_observability_enabled, harness_type, harness_thread_id, persona_id, status, iron_control_principal, proxy_labels, sandbox_last_active_at, created_at, updated_at"#,
+        )
+        .bind(input.thread_key.as_str())
+        .bind(input.harness_type.as_ref())
+        .bind(input.persona_id)
+        .bind(input.principal_id)
+        .bind(input.metadata)
+        .bind(Json(input.proxy_labels))
+        .fetch_optional(conn)
+        .await?
+        .ok_or_else(|| SessionStoreError::AlreadyExists { thread_key: input.thread_key.to_string() })?;
+        row.try_into()
+    }
+
+    /// A pure create never exposes a row without its immutable owner.
+    pub async fn create_owned_session(
+        &self,
+        input: NewSession<'_>,
+    ) -> Result<Session, SessionStoreError> {
+        Self::insert_owned_session(&mut *self.pool.acquire().await?, input).await
+    }
+
+    /// The owner, first transcript message, and replayable execution request are
+    /// one commit. Failure at any insert leaves the name available for retry.
+    pub async fn create_session_with_turn(
+        &self,
+        input: NewSession<'_>,
+        turn: &SessionTurnInput,
+    ) -> Result<(Session, SessionExecution), SessionStoreError> {
+        let mut tx = self.pool.begin().await?;
+        let thread_key = input.thread_key.clone();
+        let session = Self::insert_owned_session(&mut tx, input).await?;
+        Self::append_messages_on(&mut tx, &thread_key, std::slice::from_ref(&turn.message)).await?;
+        let execution = Self::create_execution_on(
+            &mut tx,
+            &thread_key,
+            turn.message.client_message_id.as_deref(),
+            turn.execution_metadata.clone(),
+            turn.request.clone(),
+        )
+        .await?;
+        tx.commit().await?;
+        Ok((session, execution.execution))
+    }
+
+    /// Choose exactly one route under a transaction. Starting executions must
+    /// finish their initial input write before accepting steering. The lock serializes
+    /// idle senders, and the execution lock serializes claims and completion.
+    pub async fn prepare_session_turn(
+        &self,
+        thread_key: &ThreadKey,
+        turn: &SessionTurnInput,
+    ) -> Result<PreparedSessionTurn, SessionStoreError> {
+        let mut tx = self.pool.begin().await?;
+        sqlx::query(
+            "select pg_advisory_xact_lock(hashtext('session.turn.admission'), hashtext($1))",
+        )
+        .bind(thread_key.as_str())
+        .execute(&mut *tx)
+        .await?;
+        let active = sqlx::query_as::<_, SessionExecutionRow>(
+            r#"select execution_id, idempotency_key, thread_key, status, metadata, error, created_at, updated_at, started_at, completed_at
+            from session_executions where thread_key = $1 and status in ('queued', 'running')
+            for update"#,
+        ).bind(thread_key.as_str()).fetch_optional(&mut *tx).await?;
+        let Some(active) = active else {
+            Self::append_messages_on(&mut tx, thread_key, std::slice::from_ref(&turn.message))
+                .await?;
+            let execution = Self::create_execution_on(
+                &mut tx,
+                thread_key,
+                turn.message.client_message_id.as_deref(),
+                turn.execution_metadata.clone(),
+                turn.request.clone(),
+            )
+            .await?;
+            tx.commit().await?;
+            return Ok(PreparedSessionTurn::Queued(execution.execution));
+        };
+        let execution: SessionExecution = active.try_into()?;
+        if execution.status == ExecutionStatus::Queued {
+            return Ok(PreparedSessionTurn::Starting);
+        }
+        if execution.status == ExecutionStatus::Running {
+            let ready = sqlx::query_scalar::<_, bool>(
+                "select exists(select 1 from session_events where execution_id = $1 and event_type = 'session.input_delivered')",
+            ).bind(&execution.execution_id).fetch_one(&mut *tx).await?;
+            if !ready {
+                return Ok(PreparedSessionTurn::Starting);
+            }
+        }
+        let message_ids =
+            Self::append_messages_on(&mut tx, thread_key, std::slice::from_ref(&turn.message))
+                .await?;
+        Ok(PreparedSessionTurn::Steering(SteeringSessionTurn {
+            execution,
+            message_ids,
+            transaction: tx,
+        }))
+    }
+
+    pub async fn execution_terminal_event_id(
+        &self,
+        execution_id: &str,
+    ) -> Result<Option<i64>, SessionStoreError> {
+        Ok(sqlx::query_scalar(
+            "select max(event_id) from session_events where execution_id = $1 and event_type in ('session.execution_completed', 'session.execution_failed', 'session.execution_cancelled')",
+        ).bind(execution_id).fetch_one(&self.pool).await?)
     }
 
     pub async fn get_session(&self, thread_key: &ThreadKey) -> Result<Session, SessionStoreError> {
@@ -2191,14 +2345,19 @@ mod tests {
         time::{Duration, UNIX_EPOCH},
     };
 
-    use centaur_session_core::{HarnessType, ThreadKey};
+    use centaur_session_core::{
+        ExecutionStatus, HarnessType, MessageRole, SessionMessageInput, ThreadKey,
+    };
     use serde_json::json;
     use time::{Duration as TimeDuration, OffsetDateTime};
     use uuid::Uuid;
 
-    use super::{IdleSandboxCandidateRow, PgSessionStore, SessionEventNotification};
+    use super::{
+        IdleSandboxCandidateRow, NewSession, PgSessionStore, PreparedSessionTurn,
+        SessionEventNotification, SessionStoreError, SessionTurnInput,
+    };
 
-    pub(super) async fn test_store() -> Option<PgSessionStore> {
+    async fn test_store() -> Option<PgSessionStore> {
         let Ok(url) = std::env::var("SESSION_RUNTIME_TEST_DATABASE_URL") else {
             eprintln!("skipping: SESSION_RUNTIME_TEST_DATABASE_URL not set");
             return None;
@@ -3099,6 +3258,222 @@ mod tests {
                 .await
                 .expect("release for peer")
                 .is_empty()
+        );
+    }
+
+    fn new_session(key: &ThreadKey) -> NewSession<'_> {
+        NewSession {
+            thread_key: key,
+            harness_type: &HarnessType::Codex,
+            persona_id: None,
+            principal_id: "prn_test",
+            metadata: json!({}),
+            proxy_labels: BTreeMap::new(),
+        }
+    }
+
+    fn turn(text: &str) -> SessionTurnInput {
+        SessionTurnInput {
+            message: SessionMessageInput {
+                client_message_id: Some(Uuid::new_v4().to_string()),
+                role: MessageRole::User,
+                parts: vec![json!({"type":"text", "text":text})],
+                metadata: json!({}),
+            },
+            execution_metadata: json!({}),
+            request: json!({"input_lines":[text]}),
+        }
+    }
+
+    #[tokio::test]
+    async fn initial_turn_failure_rolls_back_owner_message_and_name() {
+        let Some(store) = test_store().await else {
+            return;
+        };
+        let key = ThreadKey::parse(format!("test:atomic-turn-{}", Uuid::new_v4())).unwrap();
+        let mut input = turn("first");
+        // PostgreSQL rejects NUL in jsonb. This fails the execution insert,
+        // after the session and transcript inserts have already succeeded.
+        input.execution_metadata = json!({"invalid":"\u{0}"});
+        assert!(
+            store
+                .create_session_with_turn(new_session(&key), &input)
+                .await
+                .is_err()
+        );
+        assert!(matches!(
+            store.get_session(&key).await,
+            Err(SessionStoreError::NotFound { .. })
+        ));
+        assert!(store.list_messages(&key).await.unwrap().is_empty());
+        assert!(
+            store
+                .latest_execution_for_thread(&key)
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        input.execution_metadata = json!({});
+        let (session, execution) = store
+            .create_session_with_turn(new_session(&key), &input)
+            .await
+            .unwrap();
+        assert_eq!(session.iron_control_principal.as_deref(), Some("prn_test"));
+        assert_eq!(execution.status, ExecutionStatus::Queued);
+        assert_eq!(store.list_messages(&key).await.unwrap().len(), 1);
+        assert!(matches!(
+            store
+                .create_session_with_turn(new_session(&key), &turn("duplicate"))
+                .await,
+            Err(SessionStoreError::AlreadyExists { .. })
+        ));
+        assert_eq!(store.list_messages(&key).await.unwrap().len(), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn concurrent_idle_sends_reserve_only_one_execution() {
+        let Some(store) = test_store().await else {
+            return;
+        };
+        let key = ThreadKey::parse(format!("test:idle-send-{}", Uuid::new_v4())).unwrap();
+        store.create_owned_session(new_session(&key)).await.unwrap();
+        let mut tasks = tokio::task::JoinSet::new();
+        for _ in 0..8 {
+            let store = store.clone();
+            let key = key.clone();
+            tasks.spawn(async move { store.prepare_session_turn(&key, &turn("send")).await });
+        }
+        let mut queued = 0;
+        let mut starting = 0;
+        while let Some(result) = tasks.join_next().await {
+            match result.unwrap().unwrap() {
+                PreparedSessionTurn::Queued(_) => queued += 1,
+                PreparedSessionTurn::Starting => starting += 1,
+                PreparedSessionTurn::Steering(_) => {
+                    panic!("queued input cannot be steered before dispatch")
+                }
+            }
+        }
+        assert_eq!((queued, starting), (1, 7));
+        assert_eq!(store.list_messages(&key).await.unwrap().len(), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn steering_locks_completion_and_rollback_does_not_admit_a_message() {
+        let Some(store) = test_store().await else {
+            return;
+        };
+        let key = ThreadKey::parse(format!("test:steer-{}", Uuid::new_v4())).unwrap();
+        let (_, execution) = store
+            .create_session_with_turn(new_session(&key), &turn("first"))
+            .await
+            .unwrap();
+        // Both queued and claimed-but-not-delivered executions must finish
+        // starting before accepting another message.
+        assert!(matches!(
+            store
+                .prepare_session_turn(&key, &turn("early"))
+                .await
+                .unwrap(),
+            PreparedSessionTurn::Starting
+        ));
+        store
+            .mark_execution_running(&execution.execution_id)
+            .await
+            .unwrap();
+        assert!(matches!(
+            store
+                .prepare_session_turn(&key, &turn("early"))
+                .await
+                .unwrap(),
+            PreparedSessionTurn::Starting
+        ));
+        store
+            .append_event(
+                &key,
+                Some(&execution.execution_id),
+                "session.input_delivered",
+                json!({}),
+            )
+            .await
+            .unwrap();
+        let input = turn("steer");
+        let PreparedSessionTurn::Steering(pending) =
+            store.prepare_session_turn(&key, &input).await.unwrap()
+        else {
+            panic!("expected steering");
+        };
+        drop(pending); // Simulate a failed stdin write.
+        assert_eq!(store.list_messages(&key).await.unwrap().len(), 1);
+
+        let PreparedSessionTurn::Steering(pending) =
+            store.prepare_session_turn(&key, &input).await.unwrap()
+        else {
+            panic!("expected steering");
+        };
+        assert_eq!(pending.execution.execution_id, execution.execution_id);
+        let completion_store = store.clone();
+        let id = execution.execution_id.clone();
+        let mut completion =
+            tokio::spawn(async move { completion_store.complete_execution(&id).await });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), &mut completion)
+                .await
+                .is_err()
+        );
+        pending.commit().await.unwrap();
+        completion.await.unwrap().unwrap();
+        assert_eq!(store.list_messages(&key).await.unwrap().len(), 2);
+        // Completion won before this admission, so the next message starts a
+        // new execution rather than being steered into the terminal one.
+        let PreparedSessionTurn::Queued(next) = store
+            .prepare_session_turn(&key, &turn("after"))
+            .await
+            .unwrap()
+        else {
+            panic!("expected a new turn");
+        };
+        assert_ne!(next.execution_id, execution.execution_id);
+        assert_eq!(store.list_messages(&key).await.unwrap().len(), 3);
+    }
+
+    #[tokio::test]
+    async fn terminal_status_can_precede_the_cursor_marker() {
+        let Some(store) = test_store().await else {
+            return;
+        };
+        let key = ThreadKey::parse(format!("test:terminal-cursor-{}", Uuid::new_v4())).unwrap();
+        let (_, execution) = store
+            .create_session_with_turn(new_session(&key), &turn("first"))
+            .await
+            .unwrap();
+        store
+            .complete_execution(&execution.execution_id)
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .execution_terminal_event_id(&execution.execution_id)
+                .await
+                .unwrap(),
+            None
+        );
+        let event = store
+            .append_event(
+                &key,
+                Some(&execution.execution_id),
+                "session.execution_completed",
+                json!({"result_text":"done"}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .execution_terminal_event_id(&execution.execution_id)
+                .await
+                .unwrap(),
+            Some(event.event_id)
         );
     }
 }

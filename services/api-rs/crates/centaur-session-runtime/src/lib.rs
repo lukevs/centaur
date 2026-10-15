@@ -375,6 +375,22 @@ pub struct CreateOrGetSessionOutcome {
     pub unavailable_requested_persona_id: Option<String>,
 }
 
+/// A message takes one route: a durable queued request, or steering to an
+/// execution that was already running. Neither route creates a second turn.
+#[derive(Debug)]
+pub enum SubmitSessionTurnOutcome {
+    Queued(SessionExecution),
+    Steered(SessionExecution),
+}
+
+impl SubmitSessionTurnOutcome {
+    pub fn execution(&self) -> &SessionExecution {
+        match self {
+            Self::Queued(execution) | Self::Steered(execution) => execution,
+        }
+    }
+}
+
 /// Outcome of [`SessionRuntime::drain`]: the sandboxes that were stopped and
 /// any that failed to stop (with the backend error text).
 #[derive(Debug, Default)]
@@ -850,6 +866,13 @@ impl SessionRuntime {
             .store
             .list_events_after(thread_key, after_event_id, None, limit)
             .await?)
+    }
+
+    pub async fn execution_terminal_event_id(
+        &self,
+        execution_id: &str,
+    ) -> Result<Option<i64>, SessionRuntimeError> {
+        Ok(self.store.execution_terminal_event_id(execution_id).await?)
     }
 
     fn resolve_stored_persona(
@@ -1679,13 +1702,14 @@ impl SessionRuntime {
             }
             let creation = if existing_session_policy == ExistingSessionPolicy::Reject {
                 self.store
-                    .create_session(
+                    .create_owned_session(centaur_session_sqlx::NewSession {
                         thread_key,
                         harness_type,
-                        persona_resolution.persona_id.as_deref(),
-                        session_metadata.clone(),
-                        proxy_labels.clone(),
-                    )
+                        persona_id: persona_resolution.persona_id.as_deref(),
+                        principal_id: &registered_principal.id,
+                        metadata: session_metadata.clone(),
+                        proxy_labels: proxy_labels.clone(),
+                    })
                     .await
             } else {
                 self.store
@@ -2409,6 +2433,10 @@ impl SessionRuntime {
                     .await;
                 return Err(error);
             }
+            self.store.append_event(
+                thread_key, Some(&execution.execution_id), "session.input_delivered",
+                json!({"execution_id": execution.execution_id}),
+            ).await?;
             drop(dispatching);
 
             if let Some(max_duration) = max_duration {
@@ -2454,6 +2482,173 @@ impl SessionRuntime {
             .map_err(|source| {
                 SessionExecutionAttemptError::new(execution_id, correlation_sandbox_id, source)
             })
+    }
+
+    /// Create the owned session, first message and queued request in one commit.
+    /// Recovery can dispatch that request even if this process stops immediately
+    /// after the commit. Duplicate names never append or execute anything.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn create_session_with_initial_turn(
+        &self,
+        thread_key: &ThreadKey,
+        harness_type: &HarnessType,
+        persona_id: Option<&str>,
+        metadata: Option<Value>,
+        principal_id: &str,
+        message: SessionMessageInput,
+        input: ExecuteSessionInput,
+    ) -> Result<(CreateOrGetSessionOutcome, SessionExecution), SessionRuntimeError> {
+        let _admission = self.execution_admission.read().await;
+        if self.shutting_down.load(Ordering::SeqCst) {
+            return Err(SessionRuntimeError::ShuttingDown);
+        }
+        validate_input_lines(&input.input_lines)?;
+        let _ = duration_options(input.idle_timeout_ms, input.max_duration_ms)?;
+        let principal = self.iron_control.get_principal(principal_id).await?;
+        let capabilities = sandbox_capabilities_from_principal(&principal);
+        let resolution =
+            resolve_persona_selection(self.personas.as_deref(), persona_id, &capabilities)?;
+        let mut metadata = default_metadata(metadata);
+        let proxy_labels = proxy_labels_from_session_metadata(thread_key, &metadata);
+        if let Some(context) = resolution.context.as_ref() {
+            add_persona_metadata(&mut metadata, context);
+        }
+        let turn = persisted_session_turn(message, &input)?;
+        let (session, execution) = self
+            .store
+            .create_session_with_turn(
+                centaur_session_sqlx::NewSession {
+                    thread_key,
+                    harness_type,
+                    persona_id: resolution.persona_id.as_deref(),
+                    principal_id: &principal.id,
+                    metadata,
+                    proxy_labels,
+                },
+                &turn,
+            )
+            .await?;
+        self.spawn_session_execution(thread_key.clone(), execution.execution_id.clone(), input);
+        self.spawn_session_title_generation(thread_key);
+        Ok((
+            CreateOrGetSessionOutcome {
+                session,
+                harness_switched: false,
+                unavailable_requested_persona_id: resolution.unavailable_requested_persona_id,
+            },
+            execution,
+        ))
+    }
+
+    /// Persist one message and choose one route. A starting execution must finish
+    /// its first input write; a running one receives steering; an idle session
+    /// gets a new queued execution. Completion cannot turn steering into a second
+    /// enqueue. A failed steering write rolls back admission instead of claiming
+    /// successful delivery.
+    pub async fn submit_session_turn(
+        &self,
+        thread_key: &ThreadKey,
+        message: SessionMessageInput,
+        input: ExecuteSessionInput,
+    ) -> Result<SubmitSessionTurnOutcome, SessionRuntimeError> {
+        use centaur_session_sqlx::PreparedSessionTurn;
+        let _admission = self.execution_admission.read().await;
+        if self.shutting_down.load(Ordering::SeqCst) {
+            return Err(SessionRuntimeError::ShuttingDown);
+        }
+        validate_input_lines(&input.input_lines)?;
+        let _ = duration_options(input.idle_timeout_ms, input.max_duration_ms)?;
+        let turn = persisted_session_turn(message, &input)?;
+        let deadline = Instant::now() + STEERING_STARTUP_RETRY_TIMEOUT;
+        loop {
+            // Prepare/reconnect the pipe outside the execution lock: recovery
+            // may need to update the execution's stdout ownership itself.
+            let session = self.store.get_session(thread_key).await?;
+            let active = self.store.active_execution_for_thread(thread_key).await?;
+            let ready = if let Some(active) = active.as_ref() {
+                self.store
+                    .execution_event_exists(&active.execution_id, "session.input_delivered")
+                    .await?
+            } else {
+                false
+            };
+            let pipe = if ready {
+                if let Some(id) = session.sandbox_id.as_deref() {
+                    Some(self.ensure_session_pipe(thread_key, id).await?)
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+            match self.store.prepare_session_turn(thread_key, &turn).await? {
+                PreparedSessionTurn::Queued(execution) => {
+                    self.spawn_session_execution(
+                        thread_key.clone(),
+                        execution.execution_id.clone(),
+                        input,
+                    );
+                    self.spawn_session_title_generation(thread_key);
+                    return Ok(SubmitSessionTurnOutcome::Queued(execution));
+                }
+                PreparedSessionTurn::Steering(pending) => {
+                    let Some(pipe) = pipe else {
+                        drop(pending);
+                        continue;
+                    };
+                    let execution = &pending.execution;
+                    let span = self
+                        .execution_spans
+                        .lock()
+                        .await
+                        .get(&execution.execution_id)
+                        .cloned();
+                    let trace = SessionTraceContext::for_execution(
+                        span.as_ref(),
+                        execution_traceparent(execution).map(ToOwned::to_owned),
+                        Some(&execution.execution_id),
+                    );
+                    let lines = steering_input_lines(
+                        thread_key,
+                        std::slice::from_ref(&turn.message),
+                        &pending.message_ids,
+                    );
+                    let lines = input_lines_with_session_context(thread_key, &trace, &lines);
+                    timeout(
+                        STEERING_STARTUP_RETRY_TIMEOUT,
+                        write_input_lines(
+                            &pipe,
+                            &lines,
+                            thread_key,
+                            &execution.execution_id,
+                            session.sandbox_id.as_deref(),
+                        ),
+                    )
+                    .await
+                    .map_err(|_| {
+                        SessionRuntimeError::BadRequest(
+                            "timed out writing session steering input".to_owned(),
+                        )
+                    })??;
+                    let message_ids = pending.message_ids.clone();
+                    let execution = pending.commit().await?;
+                    if let Err(error) = self.store.append_event(thread_key, Some(&execution.execution_id), "session.steering_delivered",
+                        json!({"execution_id": execution.execution_id, "message_ids": message_ids, "input_line_count": lines.len()})).await {
+                        warn!(%thread_key, %error, "failed to record steering delivery");
+                    }
+                    self.spawn_session_title_generation(thread_key);
+                    return Ok(SubmitSessionTurnOutcome::Steered(execution));
+                }
+                PreparedSessionTurn::Starting if Instant::now() < deadline => {
+                    sleep(STEERING_STARTUP_RETRY_INTERVAL).await
+                }
+                PreparedSessionTurn::Starting => {
+                    return Err(SessionRuntimeError::BadRequest(
+                        "session input is still starting; retry the send".to_owned(),
+                    ));
+                }
+            }
+        }
     }
 
     /// Persist an execution request and return before sandbox provisioning or
@@ -7392,6 +7587,26 @@ fn persisted_execute_request(input: &ExecuteSessionInput) -> Result<Value, Sessi
     })
 }
 
+fn persisted_session_turn(
+    message: SessionMessageInput,
+    input: &ExecuteSessionInput,
+) -> Result<centaur_session_sqlx::SessionTurnInput, SessionRuntimeError> {
+    if message.role != MessageRole::User || message.client_message_id.is_none() {
+        return Err(SessionRuntimeError::BadRequest(
+            "a submitted turn needs a user message with a client message ID".to_owned(),
+        ));
+    }
+    Ok(centaur_session_sqlx::SessionTurnInput {
+        message,
+        execution_metadata: execution_metadata(
+            input.metadata.clone(),
+            input.idle_timeout_ms,
+            input.max_duration_ms,
+        ),
+        request: persisted_execute_request(input)?,
+    })
+}
+
 fn deserialize_persisted_execute_request(
     execution_id: &str,
     request: Value,
@@ -10055,6 +10270,202 @@ mod adoption_tests {
             .expect("execution exists");
         assert_eq!(latest.execution_id, execution.execution_id);
         assert_eq!(latest.status, ExecutionStatus::Completed);
+        reset_test_store(&store).await;
+    }
+
+    fn submitted_turn(text: &str) -> (SessionMessageInput, ExecuteSessionInput) {
+        let id = Uuid::new_v4().to_string();
+        (
+            SessionMessageInput {
+                client_message_id: Some(id.clone()),
+                role: MessageRole::User,
+                parts: vec![json!({"type":"text", "text":text})],
+                metadata: json!({"source":"mcp"}),
+            },
+            ExecuteSessionInput {
+                idempotency_key: Some(id),
+                metadata: Some(json!({"source":"mcp"})),
+                input_lines: vec![
+                    json!({"type":"user", "message":{"content":[{"type":"text", "text":text}]}})
+                        .to_string(),
+                ],
+                idle_timeout_ms: None,
+                max_duration_ms: None,
+            },
+        )
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn submitted_turn_waits_for_startup_steers_once_and_enqueues_when_idle() {
+        let Some(store) = test_store().await else {
+            return;
+        };
+        let _serial = TEST_LOCK.lock().await;
+        let key =
+            ThreadKey::parse(format!("mcpsession:prn_test:submit-{}", Uuid::new_v4())).unwrap();
+        let backend = Arc::new(MockBackend::new(SandboxStatus::Running, Vec::new()));
+        let gate = backend.hold_create();
+        let (io, mut stdout, stdin) = mock_io();
+        backend.push_io(io).await;
+        let runtime = runtime_with(&store, backend.clone());
+        let (message, input) = submitted_turn("first");
+        let (created, first) = timeout(
+            Duration::from_secs(1),
+            runtime.create_session_with_initial_turn(
+                &key,
+                &HarnessType::Codex,
+                None,
+                None,
+                "prn_test",
+                message,
+                input,
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            created.session.iron_control_principal.as_deref(),
+            Some("prn_test")
+        );
+        assert_eq!(store.list_messages(&key).await.unwrap().len(), 1);
+        timeout(Duration::from_secs(1), backend.create_started.notified())
+            .await
+            .unwrap();
+        let (message, input) = submitted_turn("steer");
+        let sender = runtime.clone();
+        let send_key = key.clone();
+        let mut send =
+            tokio::spawn(
+                async move { sender.submit_session_turn(&send_key, message, input).await },
+            );
+        assert!(timeout(Duration::from_millis(50), &mut send).await.is_err());
+        gate.notify_one();
+        let steered = timeout(Duration::from_secs(3), send)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(matches!(steered, SubmitSessionTurnOutcome::Steered(_)));
+        assert_eq!(steered.execution().execution_id, first.execution_id);
+        let mut stdin = FramedRead::new(stdin, LinesCodec::new());
+        let first_line: Value =
+            serde_json::from_str(&stdin.next().await.unwrap().unwrap()).unwrap();
+        let steer_line: Value =
+            serde_json::from_str(&stdin.next().await.unwrap().unwrap()).unwrap();
+        assert_eq!(first_line["message"]["content"][0]["text"], "first");
+        assert_eq!(steer_line["message"]["content"][0]["text"], "steer");
+        assert_eq!(
+            steer_line["trace_metadata"]["action"],
+            "steer_active_execution"
+        );
+        assert!(
+            timeout(Duration::from_millis(50), stdin.next())
+                .await
+                .is_err()
+        );
+        let executions: i64 =
+            sqlx::query_scalar("select count(*) from session_executions where thread_key = $1")
+                .bind(key.as_str())
+                .fetch_one(store.pool())
+                .await
+                .unwrap();
+        assert_eq!(executions, 1);
+        stdout
+            .write_all(&completed_output_bytes("first done"))
+            .await
+            .unwrap();
+        wait_for_event(&store, &key, "session.execution_completed").await;
+        let (message, input) = submitted_turn("after");
+        let next = runtime
+            .submit_session_turn(&key, message, input)
+            .await
+            .unwrap();
+        assert!(matches!(next, SubmitSessionTurnOutcome::Queued(_)));
+        assert_ne!(next.execution().execution_id, first.execution_id);
+        let after: Value = serde_json::from_str(
+            &timeout(Duration::from_secs(3), stdin.next())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(after["message"]["content"][0]["text"], "after");
+        stdout
+            .write_all(&completed_output_bytes("after done"))
+            .await
+            .unwrap();
+        timeout(Duration::from_secs(3), async {
+            while store
+                .active_execution_for_thread(&key)
+                .await
+                .unwrap()
+                .is_some()
+            {
+                sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(store.list_messages(&key).await.unwrap().len(), 3);
+        reset_test_store(&store).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn initial_turn_is_recovered_after_commit_without_dispatch() {
+        let Some(store) = test_store().await else {
+            return;
+        };
+        let _serial = TEST_LOCK.lock().await;
+        let key =
+            ThreadKey::parse(format!("mcpsession:prn_test:recover-{}", Uuid::new_v4())).unwrap();
+        let (message, input) = submitted_turn("recover");
+        let turn = persisted_session_turn(message, &input).unwrap();
+        let (_, execution) = store
+            .create_session_with_turn(
+                centaur_session_sqlx::NewSession {
+                    thread_key: &key,
+                    harness_type: &HarnessType::Codex,
+                    persona_id: None,
+                    principal_id: "prn_test",
+                    metadata: json!({}),
+                    proxy_labels: BTreeMap::new(),
+                },
+                &turn,
+            )
+            .await
+            .unwrap();
+        let backend = Arc::new(MockBackend::new(SandboxStatus::Running, Vec::new()));
+        let (io, mut stdout, stdin) = mock_io();
+        backend.push_io(io).await;
+        let runtime = runtime_with(&store, backend);
+        runtime.adopt_orphaned_executions().await;
+        let mut stdin = FramedRead::new(stdin, LinesCodec::new());
+        let line = timeout(Duration::from_secs(3), stdin.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            serde_json::from_str::<Value>(&line).unwrap()["message"]["content"][0]["text"],
+            "recover"
+        );
+        stdout
+            .write_all(&completed_output_bytes("recovered"))
+            .await
+            .unwrap();
+        wait_for_event(&store, &key, "session.execution_completed").await;
+        assert_eq!(
+            store
+                .latest_execution_for_thread(&key)
+                .await
+                .unwrap()
+                .unwrap()
+                .execution_id,
+            execution.execution_id
+        );
+        assert_eq!(store.list_messages(&key).await.unwrap().len(), 1);
         reset_test_store(&store).await;
     }
 

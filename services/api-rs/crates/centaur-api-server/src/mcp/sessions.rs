@@ -91,7 +91,7 @@ pub(super) fn mcp_session_tools() -> Vec<Value> {
             "name": TOOL_NEW,
             "description": concat!(
                 "Start a new Centaur coding session in its own sandbox and send it a first prompt. ",
-                "The session runs as you, with the same credentials and tools as your Centaur DMs. ",
+                "The session runs as you, with the same credentials and tools as your MCP tool host. ",
                 "Returns immediately; use centaur_session_peek to watch progress."
             ),
             "inputSchema": {
@@ -135,7 +135,8 @@ pub(super) fn mcp_session_tools() -> Vec<Value> {
             "name": TOOL_SEND,
             "description": concat!(
                 "Send a message to a session. Starts a new turn when the session is idle; when a ",
-                "turn is running the message is delivered to it as steering. Returns immediately."
+                "turn is running the message is delivered to it as steering. Returns after ",
+                "accepting the message; a session still starting may briefly delay the send."
             ),
             "inputSchema": {
                 "type": "object",
@@ -154,7 +155,8 @@ pub(super) fn mcp_session_tools() -> Vec<Value> {
                 "calls, and turn status. Pass the returned next_after_event_id back as ",
                 "after_event_id to read only newer activity; when more_available is true, call ",
                 "again with that cursor to continue. Set wait_ms to block until the running turn ",
-                "finishes or the wait elapses."
+                "finishes or the wait elapses. A finishing status means terminal output is still ",
+                "being persisted or replayed; continue reading with the returned cursor."
             ),
             "inputSchema": {
                 "type": "object",
@@ -387,8 +389,29 @@ fn validate_message(field: &str, text: &str) -> Result<(), McpToolCallOutcome> {
     Ok(())
 }
 
-/// Append a user message and enqueue a turn. The runtime steers the message
-/// into an active turn instead of starting a second one.
+fn turn_input(
+    principal: &McpPrincipal,
+    text: &str,
+    action: &str,
+) -> Result<(SessionMessageInput, ExecuteSessionInput), ApiError> {
+    let request_id = format!("mcp-{}", Uuid::new_v4().simple());
+    Ok((
+        SessionMessageInput {
+            client_message_id: Some(request_id.clone()),
+            role: MessageRole::User,
+            parts: vec![json!({"type": "text", "text": text})],
+            metadata: mcp_session_metadata(principal, action),
+        },
+        ExecuteSessionInput {
+            idempotency_key: Some(request_id),
+            metadata: Some(mcp_session_metadata(principal, action)),
+            input_lines: vec![user_input_line(text)?],
+            idle_timeout_ms: None,
+            max_duration_ms: None,
+        },
+    ))
+}
+
 async fn send_turn(
     state: &AppState,
     principal: &McpPrincipal,
@@ -396,32 +419,13 @@ async fn send_turn(
     text: &str,
     action: &str,
 ) -> Result<(String, String), ApiError> {
-    let runtime = state.runtime()?;
-    let request_id = format!("mcp-{}", Uuid::new_v4().simple());
-    runtime
-        .append_messages(
-            thread_key,
-            &[SessionMessageInput {
-                client_message_id: Some(request_id.clone()),
-                role: MessageRole::User,
-                parts: vec![json!({"type": "text", "text": text})],
-                metadata: mcp_session_metadata(principal, action),
-            }],
-        )
+    let (message, input) = turn_input(principal, text, action)?;
+    let outcome = state
+        .runtime()?
+        .submit_session_turn(thread_key, message, input)
         .await?;
-    let execution = runtime
-        .enqueue_session_execution(
-            thread_key,
-            ExecuteSessionInput {
-                idempotency_key: Some(request_id),
-                metadata: Some(mcp_session_metadata(principal, action)),
-                input_lines: vec![user_input_line(text)?],
-                idle_timeout_ms: None,
-                max_duration_ms: None,
-            },
-        )
-        .await?;
-    Ok((execution.execution_id, execution.status.to_string()))
+    let execution = outcome.execution();
+    Ok((execution.execution_id.clone(), execution.status.to_string()))
 }
 
 async fn session_new(
@@ -447,8 +451,9 @@ async fn session_new(
     };
     let runtime = state.runtime()?;
     let harness = args.harness.unwrap_or(HarnessType::Codex);
-    let outcome = match runtime
-        .create_session_with_principal(
+    let (message, input) = turn_input(principal, &args.prompt, "new")?;
+    let (outcome, execution) = match runtime
+        .create_session_with_initial_turn(
             &thread_key,
             &harness,
             args.persona
@@ -457,6 +462,8 @@ async fn session_new(
                 .filter(|p| !p.is_empty()),
             Some(mcp_session_metadata(principal, "create")),
             &principal.principal_id,
+            message,
+            input,
         )
         .await
     {
@@ -468,8 +475,8 @@ async fn session_new(
         }
         Err(error) => return Err(error.into()),
     };
-    let (execution_id, status) =
-        send_turn(state, principal, &thread_key, &args.prompt, "new").await?;
+    let execution_id = execution.execution_id;
+    let status = execution.status.to_string();
     record_mcp_tool_correlation(&Span::current(), None, Some(&execution_id), None);
     tool_json(json!({
         "session": name,
@@ -624,9 +631,15 @@ async fn session_peek(
     }
 
     let mut execution = runtime.latest_execution(&thread_key).await?;
-    let running = execution
-        .as_ref()
-        .is_some_and(|execution| execution_active(&execution.status));
+    let terminal_id = match execution.as_ref() {
+        Some(e) if !execution_active(&e.status) => {
+            runtime.execution_terminal_event_id(&e.execution_id).await?
+        }
+        _ => None,
+    };
+    let running = execution.as_ref().is_some_and(|execution| {
+        peek_execution_pending(&execution.status, terminal_id, view.cursor)
+    });
     if !wait.is_zero() && !view.more && running {
         // Long-poll for the running turn to finish, collecting activity as it
         // streams in.
@@ -637,7 +650,9 @@ async fn session_peek(
         // Stops at the deadline, at stream end, or after a terminal event.
         while let Ok(Some(event)) = timeout_at(deadline, events.next()).await {
             let event = event?;
-            let terminal = is_terminal_event(&event.event_type);
+            let terminal = is_terminal_event(&event.event_type)
+                && event.execution_id.as_deref()
+                    == execution.as_ref().map(|e| e.execution_id.as_str());
             view.push(&event);
             if terminal {
                 break;
@@ -649,13 +664,22 @@ async fn session_peek(
     if let Some(execution) = execution.as_ref() {
         record_mcp_tool_correlation(&Span::current(), None, Some(&execution.execution_id), None);
     }
+    let terminal_id = match execution.as_ref() {
+        Some(e) if !execution_active(&e.status) => {
+            runtime.execution_terminal_event_id(&e.execution_id).await?
+        }
+        _ => None,
+    };
+    let finishing = execution.as_ref().is_some_and(|e| {
+        !execution_active(&e.status) && peek_execution_pending(&e.status, terminal_id, view.cursor)
+    });
     tool_json(json!({
         "session": args.session.trim(),
-        "status": execution_state(execution.as_ref().map(|e| &e.status)),
+        "status": if finishing { "finishing".to_owned() } else { execution_state(execution.as_ref().map(|e| &e.status)) },
         "execution_id": execution.as_ref().map(|e| e.execution_id.as_str()),
         "error": execution.as_ref().and_then(|e| e.error.as_deref()),
         "next_after_event_id": view.cursor,
-        "more_available": view.more,
+        "more_available": view.more || finishing,
         "omitted_entries": view.omitted,
         "entries": view.entries,
     }))
@@ -722,6 +746,12 @@ fn is_terminal_event(event_type: &str) -> bool {
 
 fn execution_active(status: &ExecutionStatus) -> bool {
     matches!(status, ExecutionStatus::Queued | ExecutionStatus::Running)
+}
+
+/// Completion is visible to a cursor reader only after the execution's terminal
+/// event has been consumed. Status can commit before the event is appended.
+fn peek_execution_pending(status: &ExecutionStatus, terminal_id: Option<i64>, cursor: i64) -> bool {
+    execution_active(status) || terminal_id.is_none_or(|id| id > cursor)
 }
 
 fn execution_state(status: Option<&ExecutionStatus>) -> String {
@@ -1125,5 +1155,25 @@ mod tests {
         assert!(truncate_text(&long).ends_with("…[truncated]"));
         assert_eq!(tail_text("abcdef", 3), "[truncated]…def");
         assert_eq!(tail_text("abc", 3), "abc");
+    }
+
+    #[test]
+    fn peek_waits_for_terminal_output_even_after_status_commits() {
+        for status in [
+            ExecutionStatus::Completed,
+            ExecutionStatus::Failed,
+            ExecutionStatus::Cancelled,
+        ] {
+            assert!(peek_execution_pending(&status, None, 10));
+            assert!(peek_execution_pending(&status, Some(12), 10));
+            assert!(!peek_execution_pending(&status, Some(12), 12));
+            assert!(!peek_execution_pending(&status, Some(12), 15));
+        }
+        assert!(peek_execution_pending(&ExecutionStatus::Queued, None, 10));
+        assert!(peek_execution_pending(
+            &ExecutionStatus::Running,
+            Some(8),
+            10
+        ));
     }
 }

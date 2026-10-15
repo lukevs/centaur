@@ -19,6 +19,9 @@ use time::{Duration as TimeDuration, OffsetDateTime};
 use uuid::Uuid;
 
 mod migrations;
+mod turns;
+
+pub use turns::{NewSession, PreparedSessionTurn, SessionTurnInput};
 
 pub use migrations::{TextSearchBackend, migrate, migration_list};
 
@@ -324,6 +327,16 @@ impl PgSessionStore {
         messages: &[SessionMessageInput],
     ) -> Result<Vec<String>, SessionStoreError> {
         let mut tx = self.pool.begin().await?;
+        let message_ids = Self::append_messages_on(&mut tx, thread_key, messages).await?;
+        tx.commit().await?;
+        Ok(message_ids)
+    }
+
+    async fn append_messages_on(
+        conn: &mut sqlx::PgConnection,
+        thread_key: &ThreadKey,
+        messages: &[SessionMessageInput],
+    ) -> Result<Vec<String>, SessionStoreError> {
         let mut message_ids = Vec::with_capacity(messages.len());
 
         for message in messages {
@@ -346,12 +359,11 @@ impl PgSessionStore {
             .bind(message.role.as_ref())
             .bind(parts)
             .bind(message.metadata.clone())
-            .fetch_one(&mut *tx)
+            .fetch_one(&mut *conn)
             .await?;
             message_ids.push(persisted_message_id);
         }
 
-        tx.commit().await?;
         Ok(message_ids)
     }
 
@@ -444,6 +456,23 @@ impl PgSessionStore {
         metadata: Value,
         request: Value,
     ) -> Result<CreateExecutionResult, SessionStoreError> {
+        Self::create_execution_on(
+            &mut *self.pool.acquire().await?,
+            thread_key,
+            idempotency_key,
+            metadata,
+            request,
+        )
+        .await
+    }
+
+    async fn create_execution_on(
+        conn: &mut sqlx::PgConnection,
+        thread_key: &ThreadKey,
+        idempotency_key: Option<&str>,
+        metadata: Value,
+        request: Value,
+    ) -> Result<CreateExecutionResult, SessionStoreError> {
         let execution_id = prefixed_id("exe");
         let row = sqlx::query_as::<_, CreateExecutionRow>(
             r#"
@@ -478,7 +507,7 @@ impl PgSessionStore {
         .bind(ExecutionStatus::Queued.as_ref())
         .bind(metadata)
         .bind(request)
-        .fetch_one(&self.pool)
+        .fetch_one(&mut *conn)
         .await?;
 
         row.try_into()
@@ -2169,7 +2198,7 @@ mod tests {
 
     use super::{IdleSandboxCandidateRow, PgSessionStore, SessionEventNotification};
 
-    async fn test_store() -> Option<PgSessionStore> {
+    pub(super) async fn test_store() -> Option<PgSessionStore> {
         let Ok(url) = std::env::var("SESSION_RUNTIME_TEST_DATABASE_URL") else {
             eprintln!("skipping: SESSION_RUNTIME_TEST_DATABASE_URL not set");
             return None;

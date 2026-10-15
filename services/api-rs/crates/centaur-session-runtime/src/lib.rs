@@ -759,6 +759,13 @@ struct PersonaResolution {
     unavailable_requested_persona_id: Option<String>,
 }
 
+struct ResolvedSessionCreation {
+    principal_id: String,
+    persona: PersonaResolution,
+    metadata: Value,
+    proxy_labels: BTreeMap<String, String>,
+}
+
 impl SessionRuntime {
     pub fn new(
         store: PgSessionStore,
@@ -2504,6 +2511,26 @@ impl SessionRuntime {
         }
         validate_input_lines(&input.input_lines)?;
         let _ = duration_options(input.idle_timeout_ms, input.max_duration_ms)?;
+        let creation = self
+            .resolve_session_creation(thread_key, persona_id, metadata, principal_id)
+            .await?;
+        let turn = build_persisted_session_turn(message, &input)?;
+        let (outcome, execution) = self
+            .persist_initial_session_turn(thread_key, harness_type, creation, &turn)
+            .await?;
+        self.spawn_session_execution(thread_key.clone(), execution.execution_id.clone(), input);
+        self.spawn_session_title_generation(thread_key);
+        Ok((outcome, execution))
+    }
+
+    /// Resolve the owner and persona before opening the creation transaction.
+    async fn resolve_session_creation(
+        &self,
+        thread_key: &ThreadKey,
+        persona_id: Option<&str>,
+        metadata: Option<Value>,
+        principal_id: &str,
+    ) -> Result<ResolvedSessionCreation, SessionRuntimeError> {
         let principal = self.iron_control.get_principal(principal_id).await?;
         let capabilities = sandbox_capabilities_from_principal(&principal);
         let resolution =
@@ -2513,28 +2540,42 @@ impl SessionRuntime {
         if let Some(context) = resolution.context.as_ref() {
             add_persona_metadata(&mut metadata, context);
         }
-        let turn = persisted_session_turn(message, &input)?;
+        Ok(ResolvedSessionCreation {
+            principal_id: principal.id,
+            persona: resolution,
+            metadata,
+            proxy_labels,
+        })
+    }
+
+    /// Commit the resolved session and its first request together. Dispatch is
+    /// deliberately left to the caller after the transaction has committed.
+    async fn persist_initial_session_turn(
+        &self,
+        thread_key: &ThreadKey,
+        harness_type: &HarnessType,
+        creation: ResolvedSessionCreation,
+        turn: &centaur_session_sqlx::SessionTurnInput,
+    ) -> Result<(CreateOrGetSessionOutcome, SessionExecution), SessionRuntimeError> {
         let (session, execution) = self
             .store
             .create_session_with_turn(
                 centaur_session_sqlx::NewSession {
                     thread_key,
                     harness_type,
-                    persona_id: resolution.persona_id.as_deref(),
-                    principal_id: &principal.id,
-                    metadata,
-                    proxy_labels,
+                    persona_id: creation.persona.persona_id.as_deref(),
+                    principal_id: &creation.principal_id,
+                    metadata: creation.metadata,
+                    proxy_labels: creation.proxy_labels,
                 },
-                &turn,
+                turn,
             )
             .await?;
-        self.spawn_session_execution(thread_key.clone(), execution.execution_id.clone(), input);
-        self.spawn_session_title_generation(thread_key);
         Ok((
             CreateOrGetSessionOutcome {
                 session,
                 harness_switched: false,
-                unavailable_requested_persona_id: resolution.unavailable_requested_persona_id,
+                unavailable_requested_persona_id: creation.persona.unavailable_requested_persona_id,
             },
             execution,
         ))
@@ -2558,29 +2599,10 @@ impl SessionRuntime {
         }
         validate_input_lines(&input.input_lines)?;
         let _ = duration_options(input.idle_timeout_ms, input.max_duration_ms)?;
-        let turn = persisted_session_turn(message, &input)?;
+        let turn = build_persisted_session_turn(message, &input)?;
         let deadline = Instant::now() + STEERING_STARTUP_RETRY_TIMEOUT;
         loop {
-            // Prepare/reconnect the pipe outside the execution lock: recovery
-            // may need to update the execution's stdout ownership itself.
-            let session = self.store.get_session(thread_key).await?;
-            let active = self.store.active_execution_for_thread(thread_key).await?;
-            let ready = if let Some(active) = active.as_ref() {
-                self.store
-                    .execution_event_exists(&active.execution_id, "session.input_delivered")
-                    .await?
-            } else {
-                false
-            };
-            let pipe = if ready {
-                if let Some(id) = session.sandbox_id.as_deref() {
-                    Some(self.ensure_session_pipe(thread_key, id).await?)
-                } else {
-                    None
-                }
-            } else {
-                None
-            };
+            let connection = self.connect_steering_pipe(thread_key).await?;
             match self.store.prepare_session_turn(thread_key, &turn).await? {
                 PreparedSessionTurn::Queued(execution) => {
                     self.spawn_session_execution(
@@ -2592,50 +2614,19 @@ impl SessionRuntime {
                     return Ok(SubmitSessionTurnOutcome::Queued(execution));
                 }
                 PreparedSessionTurn::Steering(pending) => {
-                    let Some(pipe) = pipe else {
+                    let Some((sandbox_id, pipe)) = connection else {
                         drop(pending);
                         continue;
                     };
-                    let execution = &pending.execution;
-                    let span = self
-                        .execution_spans
-                        .lock()
-                        .await
-                        .get(&execution.execution_id)
-                        .cloned();
-                    let trace = SessionTraceContext::for_execution(
-                        span.as_ref(),
-                        execution_traceparent(execution).map(ToOwned::to_owned),
-                        Some(&execution.execution_id),
-                    );
-                    let lines = steering_input_lines(
-                        thread_key,
-                        std::slice::from_ref(&turn.message),
-                        &pending.message_ids,
-                    );
-                    let lines = input_lines_with_session_context(thread_key, &trace, &lines);
-                    timeout(
-                        STEERING_STARTUP_RETRY_TIMEOUT,
-                        write_input_lines(
-                            &pipe,
-                            &lines,
+                    let execution = self
+                        .deliver_admitted_steering(
                             thread_key,
-                            &execution.execution_id,
-                            session.sandbox_id.as_deref(),
-                        ),
-                    )
-                    .await
-                    .map_err(|_| {
-                        SessionRuntimeError::BadRequest(
-                            "timed out writing session steering input".to_owned(),
+                            pending,
+                            &turn.message,
+                            &pipe,
+                            &sandbox_id,
                         )
-                    })??;
-                    let message_ids = pending.message_ids.clone();
-                    let execution = pending.commit().await?;
-                    if let Err(error) = self.store.append_event(thread_key, Some(&execution.execution_id), "session.steering_delivered",
-                        json!({"execution_id": execution.execution_id, "message_ids": message_ids, "input_line_count": lines.len()})).await {
-                        warn!(%thread_key, %error, "failed to record steering delivery");
-                    }
+                        .await?;
                     self.spawn_session_title_generation(thread_key);
                     return Ok(SubmitSessionTurnOutcome::Steered(execution));
                 }
@@ -2649,6 +2640,75 @@ impl SessionRuntime {
                 }
             }
         }
+    }
+
+    /// Connect before taking the execution lock: reconnecting a pipe may itself
+    /// need to update stdout ownership. Starting or idle sessions have no pipe
+    /// ready for steering yet.
+    async fn connect_steering_pipe(
+        &self,
+        thread_key: &ThreadKey,
+    ) -> Result<Option<(String, SessionPipe)>, SessionRuntimeError> {
+        let session = self.store.get_session(thread_key).await?;
+        let Some(active) = self.store.active_execution_for_thread(thread_key).await? else {
+            return Ok(None);
+        };
+        if !self
+            .store
+            .execution_event_exists(&active.execution_id, "session.input_delivered")
+            .await?
+        {
+            return Ok(None);
+        }
+        let Some(sandbox_id) = session.sandbox_id else {
+            return Ok(None);
+        };
+        let pipe = self.ensure_session_pipe(thread_key, &sandbox_id).await?;
+        Ok(Some((sandbox_id, pipe)))
+    }
+
+    /// Keep admission locked through the bounded write, then commit the message
+    /// and record delivery. An error before commit drops the transaction.
+    async fn deliver_admitted_steering(
+        &self,
+        thread_key: &ThreadKey,
+        pending: centaur_session_sqlx::SteeringSessionTurn,
+        message: &SessionMessageInput,
+        pipe: &SessionPipe,
+        sandbox_id: &str,
+    ) -> Result<SessionExecution, SessionRuntimeError> {
+        let lines = steering_input_lines(
+            thread_key,
+            std::slice::from_ref(message),
+            &pending.message_ids,
+        );
+        let lines = self
+            .build_traced_input_lines(thread_key, &pending.execution, &lines)
+            .await;
+        timeout(
+            STEERING_STARTUP_RETRY_TIMEOUT,
+            write_input_lines(
+                pipe,
+                &lines,
+                thread_key,
+                &pending.execution.execution_id,
+                Some(sandbox_id),
+            ),
+        )
+        .await
+        .map_err(|_| {
+            SessionRuntimeError::BadRequest("timed out writing session steering input".to_owned())
+        })??;
+        let message_ids = pending.message_ids.clone();
+        let execution = pending.commit().await?;
+        self.record_steering_delivery(
+            thread_key,
+            &execution.execution_id,
+            &message_ids,
+            lines.len(),
+        )
+        .await;
+        Ok(execution)
     }
 
     /// Persist an execution request and return before sandbox provisioning or
@@ -2848,6 +2908,56 @@ impl SessionRuntime {
             .await;
     }
 
+    /// Join input to the execution's live trace, falling back to its persisted
+    /// trace context when this process does not own the execution span.
+    async fn build_traced_input_lines(
+        &self,
+        thread_key: &ThreadKey,
+        execution: &SessionExecution,
+        input_lines: &[String],
+    ) -> Vec<String> {
+        let execution_span = self
+            .execution_spans
+            .lock()
+            .await
+            .get(&execution.execution_id)
+            .cloned();
+        let trace = SessionTraceContext::for_execution(
+            execution_span.as_ref(),
+            execution_traceparent(execution).map(ToOwned::to_owned),
+            Some(&execution.execution_id),
+        );
+        input_lines_with_session_context(thread_key, &trace, input_lines)
+    }
+
+    /// Delivery has already happened. Failure to record its diagnostic event
+    /// must not turn an accepted input into an error that invites a retry.
+    async fn record_steering_delivery(
+        &self,
+        thread_key: &ThreadKey,
+        execution_id: &str,
+        message_ids: &[String],
+        input_line_count: usize,
+    ) {
+        if let Err(error) = self
+            .store
+            .append_event(
+                thread_key,
+                Some(execution_id),
+                "session.steering_delivered",
+                json!({
+                    "execution_id": execution_id,
+                    "thread_key": thread_key.as_str(),
+                    "message_ids": message_ids,
+                    "input_line_count": input_line_count,
+                }),
+            )
+            .await
+        {
+            warn!(%thread_key, %error, "failed to record steering delivery");
+        }
+    }
+
     async fn forward_messages_to_active_execution(
         &self,
         thread_key: &ThreadKey,
@@ -2869,20 +2979,9 @@ impl SessionRuntime {
             return;
         };
 
-        // Steering joins the active execution's trace so harness spans for the
-        // steered turn stay in the same tree.
-        let execution_span = self
-            .execution_spans
-            .lock()
-            .await
-            .get(&execution.execution_id)
-            .cloned();
-        let trace = SessionTraceContext::for_execution(
-            execution_span.as_ref(),
-            execution_traceparent(&execution).map(ToOwned::to_owned),
-            Some(&execution.execution_id),
-        );
-        let input_lines = input_lines_with_session_context(thread_key, &trace, &input_lines);
+        let input_lines = self
+            .build_traced_input_lines(thread_key, &execution, &input_lines)
+            .await;
 
         let pipe = match self
             .wait_for_active_steering_pipe(thread_key, &execution.execution_id)
@@ -2910,23 +3009,13 @@ impl SessionRuntime {
             return;
         }
 
-        if let Err(error) = self
-            .store
-            .append_event(
-                thread_key,
-                Some(&execution.execution_id),
-                "session.steering_delivered",
-                json!({
-                    "execution_id": execution.execution_id,
-                    "thread_key": thread_key.as_str(),
-                    "message_ids": message_ids,
-                    "input_line_count": input_lines.len(),
-                }),
-            )
-            .await
-        {
-            warn!(%thread_key, %error, "failed to record steering delivery");
-        }
+        self.record_steering_delivery(
+            thread_key,
+            &execution.execution_id,
+            message_ids,
+            input_lines.len(),
+        )
+        .await;
     }
 
     pub async fn interrupt_active_execution(
@@ -7587,7 +7676,7 @@ fn persisted_execute_request(input: &ExecuteSessionInput) -> Result<Value, Sessi
     })
 }
 
-fn persisted_session_turn(
+fn build_persisted_session_turn(
     message: SessionMessageInput,
     input: &ExecuteSessionInput,
 ) -> Result<centaur_session_sqlx::SessionTurnInput, SessionRuntimeError> {
@@ -10421,7 +10510,7 @@ mod adoption_tests {
         let key =
             ThreadKey::parse(format!("mcpsession:prn_test:recover-{}", Uuid::new_v4())).unwrap();
         let (message, input) = submitted_turn("recover");
-        let turn = persisted_session_turn(message, &input).unwrap();
+        let turn = build_persisted_session_turn(message, &input).unwrap();
         let (_, execution) = store
             .create_session_with_turn(
                 centaur_session_sqlx::NewSession {
@@ -10466,6 +10555,67 @@ mod adoption_tests {
             execution.execution_id
         );
         assert_eq!(store.list_messages(&key).await.unwrap().len(), 1);
+        reset_test_store(&store).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn append_messages_preserves_transcript_when_steering_fails() {
+        let Some(store) = test_store().await else {
+            return;
+        };
+        let _serial = TEST_LOCK.lock().await;
+        let key =
+            ThreadKey::parse(format!("test:append-steering-failure-{}", Uuid::new_v4())).unwrap();
+        let backend = Arc::new(MockBackend::new(SandboxStatus::Running, Vec::new()));
+        let (io, stdout, stdin) = mock_io();
+        backend.push_io(io).await;
+        let runtime = runtime_with(&store, backend);
+        runtime
+            .create_or_get_session(
+                &key,
+                &HarnessType::Codex,
+                None,
+                None,
+                HarnessConflictPolicy::Reject,
+            )
+            .await
+            .unwrap();
+        let (first_message, input) = submitted_turn("first");
+        runtime
+            .append_messages(&key, &[first_message])
+            .await
+            .unwrap();
+        runtime
+            .enqueue_session_execution(&key, input)
+            .await
+            .unwrap();
+        wait_for_event(&store, &key, "session.input_delivered").await;
+
+        drop(stdin); // The transcript append succeeds even if the live write cannot.
+        let (followup, _) = submitted_turn("followup");
+        let ids = runtime.append_messages(&key, &[followup]).await.unwrap();
+        assert_eq!(ids.len(), 1);
+        let messages = store.list_messages(&key).await.unwrap();
+        assert_eq!(messages.len(), 2);
+        assert!(
+            messages
+                .iter()
+                .any(|message| message.parts == vec![json!({"type":"text", "text":"followup"})])
+        );
+        let recorded = events(&store, &key).await;
+        assert!(
+            recorded
+                .iter()
+                .any(|event| event.event_type == "session.steering_failed")
+        );
+        assert!(
+            !recorded
+                .iter()
+                .any(|event| event.event_type == "session.steering_delivered")
+        );
+
+        drop(stdout);
+        wait_for_event(&store, &key, "session.execution_failed").await;
         reset_test_store(&store).await;
     }
 

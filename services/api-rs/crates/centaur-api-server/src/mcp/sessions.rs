@@ -389,7 +389,7 @@ fn validate_message(field: &str, text: &str) -> Result<(), McpToolCallOutcome> {
     Ok(())
 }
 
-fn turn_input(
+fn build_turn_input(
     principal: &McpPrincipal,
     text: &str,
     action: &str,
@@ -419,7 +419,7 @@ async fn send_turn(
     text: &str,
     action: &str,
 ) -> Result<(String, String), ApiError> {
-    let (message, input) = turn_input(principal, text, action)?;
+    let (message, input) = build_turn_input(principal, text, action)?;
     let outcome = state
         .runtime()?
         .submit_session_turn(thread_key, message, input)
@@ -451,7 +451,7 @@ async fn session_new(
     };
     let runtime = state.runtime()?;
     let harness = args.harness.unwrap_or(HarnessType::Codex);
-    let (message, input) = turn_input(principal, &args.prompt, "new")?;
+    let (message, input) = build_turn_input(principal, &args.prompt, "new")?;
     let (outcome, execution) = match runtime
         .create_session_with_initial_turn(
             &thread_key,

@@ -422,7 +422,7 @@ async fn send_turn(
     let (message, input) = build_turn_input(principal, text, action)?;
     let outcome = state
         .runtime()?
-        .submit_session_turn(thread_key, message, input)
+        .append_message_and_start_or_steer_execution(thread_key, message, input)
         .await?;
     let execution = outcome.execution();
     Ok((execution.execution_id.clone(), execution.status.to_string()))

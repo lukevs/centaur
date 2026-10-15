@@ -378,12 +378,12 @@ pub struct CreateOrGetSessionOutcome {
 /// A message takes one route: a durable queued request, or steering to an
 /// execution that was already running. Neither route creates a second turn.
 #[derive(Debug)]
-pub enum SubmitSessionTurnOutcome {
+pub enum StartOrSteerExecutionOutcome {
     Queued(SessionExecution),
     Steered(SessionExecution),
 }
 
-impl SubmitSessionTurnOutcome {
+impl StartOrSteerExecutionOutcome {
     pub fn execution(&self) -> &SessionExecution {
         match self {
             Self::Queued(execution) | Self::Steered(execution) => execution,
@@ -2515,12 +2515,30 @@ impl SessionRuntime {
             .resolve_session_creation(thread_key, persona_id, metadata, principal_id)
             .await?;
         let turn = build_persisted_session_turn(message, &input)?;
-        let (outcome, execution) = self
-            .persist_initial_session_turn(thread_key, harness_type, creation, &turn)
+        let (session, execution) = self
+            .store
+            .create_session_with_turn(
+                centaur_session_sqlx::NewSession {
+                    thread_key,
+                    harness_type,
+                    persona_id: creation.persona.persona_id.as_deref(),
+                    principal_id: &creation.principal_id,
+                    metadata: creation.metadata,
+                    proxy_labels: creation.proxy_labels,
+                },
+                &turn,
+            )
             .await?;
         self.spawn_session_execution(thread_key.clone(), execution.execution_id.clone(), input);
         self.spawn_session_title_generation(thread_key);
-        Ok((outcome, execution))
+        Ok((
+            CreateOrGetSessionOutcome {
+                session,
+                harness_switched: false,
+                unavailable_requested_persona_id: creation.persona.unavailable_requested_persona_id,
+            },
+            execution,
+        ))
     }
 
     /// Resolve the owner and persona before opening the creation transaction.
@@ -2548,50 +2566,17 @@ impl SessionRuntime {
         })
     }
 
-    /// Commit the resolved session and its first request together. Dispatch is
-    /// deliberately left to the caller after the transaction has committed.
-    async fn persist_initial_session_turn(
-        &self,
-        thread_key: &ThreadKey,
-        harness_type: &HarnessType,
-        creation: ResolvedSessionCreation,
-        turn: &centaur_session_sqlx::SessionTurnInput,
-    ) -> Result<(CreateOrGetSessionOutcome, SessionExecution), SessionRuntimeError> {
-        let (session, execution) = self
-            .store
-            .create_session_with_turn(
-                centaur_session_sqlx::NewSession {
-                    thread_key,
-                    harness_type,
-                    persona_id: creation.persona.persona_id.as_deref(),
-                    principal_id: &creation.principal_id,
-                    metadata: creation.metadata,
-                    proxy_labels: creation.proxy_labels,
-                },
-                turn,
-            )
-            .await?;
-        Ok((
-            CreateOrGetSessionOutcome {
-                session,
-                harness_switched: false,
-                unavailable_requested_persona_id: creation.persona.unavailable_requested_persona_id,
-            },
-            execution,
-        ))
-    }
-
     /// Persist one message and choose one route. A starting execution must finish
     /// its first input write; a running one receives steering; an idle session
     /// gets a new queued execution. Completion cannot turn steering into a second
     /// enqueue. A failed steering write rolls back admission instead of claiming
     /// successful delivery.
-    pub async fn submit_session_turn(
+    pub async fn append_message_and_start_or_steer_execution(
         &self,
         thread_key: &ThreadKey,
         message: SessionMessageInput,
         input: ExecuteSessionInput,
-    ) -> Result<SubmitSessionTurnOutcome, SessionRuntimeError> {
+    ) -> Result<StartOrSteerExecutionOutcome, SessionRuntimeError> {
         use centaur_session_sqlx::PreparedSessionTurn;
         let _admission = self.execution_admission.read().await;
         if self.shutting_down.load(Ordering::SeqCst) {
@@ -2611,7 +2596,7 @@ impl SessionRuntime {
                         input,
                     );
                     self.spawn_session_title_generation(thread_key);
-                    return Ok(SubmitSessionTurnOutcome::Queued(execution));
+                    return Ok(StartOrSteerExecutionOutcome::Queued(execution));
                 }
                 PreparedSessionTurn::Steering(pending) => {
                     let Some((sandbox_id, pipe)) = connection else {
@@ -2628,7 +2613,7 @@ impl SessionRuntime {
                         )
                         .await?;
                     self.spawn_session_title_generation(thread_key);
-                    return Ok(SubmitSessionTurnOutcome::Steered(execution));
+                    return Ok(StartOrSteerExecutionOutcome::Steered(execution));
                 }
                 PreparedSessionTurn::Starting if Instant::now() < deadline => {
                     sleep(STEERING_STARTUP_RETRY_INTERVAL).await
@@ -10385,7 +10370,7 @@ mod adoption_tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn submitted_turn_waits_for_startup_steers_once_and_enqueues_when_idle() {
+    async fn append_message_waits_for_startup_steers_once_and_enqueues_when_idle() {
         let Some(store) = test_store().await else {
             return;
         };
@@ -10424,10 +10409,11 @@ mod adoption_tests {
         let (message, input) = submitted_turn("steer");
         let sender = runtime.clone();
         let send_key = key.clone();
-        let mut send =
-            tokio::spawn(
-                async move { sender.submit_session_turn(&send_key, message, input).await },
-            );
+        let mut send = tokio::spawn(async move {
+            sender
+                .append_message_and_start_or_steer_execution(&send_key, message, input)
+                .await
+        });
         assert!(timeout(Duration::from_millis(50), &mut send).await.is_err());
         gate.notify_one();
         let steered = timeout(Duration::from_secs(3), send)
@@ -10435,7 +10421,7 @@ mod adoption_tests {
             .unwrap()
             .unwrap()
             .unwrap();
-        assert!(matches!(steered, SubmitSessionTurnOutcome::Steered(_)));
+        assert!(matches!(steered, StartOrSteerExecutionOutcome::Steered(_)));
         assert_eq!(steered.execution().execution_id, first.execution_id);
         let mut stdin = FramedRead::new(stdin, LinesCodec::new());
         let first_line: Value =
@@ -10467,10 +10453,10 @@ mod adoption_tests {
         wait_for_event(&store, &key, "session.execution_completed").await;
         let (message, input) = submitted_turn("after");
         let next = runtime
-            .submit_session_turn(&key, message, input)
+            .append_message_and_start_or_steer_execution(&key, message, input)
             .await
             .unwrap();
-        assert!(matches!(next, SubmitSessionTurnOutcome::Queued(_)));
+        assert!(matches!(next, StartOrSteerExecutionOutcome::Queued(_)));
         assert_ne!(next.execution().execution_id, first.execution_id);
         let after: Value = serde_json::from_str(
             &timeout(Duration::from_secs(3), stdin.next())
